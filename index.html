@@ -1,0 +1,4638 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>モンスターハンター steal</title>
+<style>
+  body {
+    margin: 0;
+    background-color: #111;
+    color: #fff;
+    font-family: 'Hiragino Kaku Gothic ProN', 'Meiryo', sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    overflow: hidden;
+  }
+  canvas {
+    background: linear-gradient(to bottom, #2c1618 0%, #59261d 65%, #2b2118 65%, #1a140e 100%);
+    border: 3px solid #8a6d3b;
+    box-shadow: 0 0 25px rgba(255, 80, 0, 0.4);
+  }
+  #controls-info {
+    margin-top: 10px;
+    font-size: 13px;
+    color: #ccc;
+    background: #222;
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: 1px solid #444;
+  }
+  .key {
+    background: #444;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #ffd700;
+    font-weight: bold;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="gameCanvas" width="900" height="500"></canvas>
+<div id="controls-info"></div>
+
+<!-- 追加コンテンツ用の箱を読み込み -->
+<script src="extra_content.js"></script>
+<script src="extra_content2.js"></script>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const controlsInfoEl = document.getElementById('controls-info');
+
+const GROUND_Y = 390;
+const GRAVITY = 0.6;
+
+// 外部拡張データの受け皿取得
+const EXTRA = window.EXTRA_CONTENT || {
+  weaponTypes: [],
+  weapons: { longsword: [], greatsword: [], dualblades: [] },
+  armors: { head: [], chest: [], arms: [], waist: [], legs: [] },
+  skillNames: {},
+  quests: [],
+  hooks: {}
+};
+const EXTRA_HOOKS = EXTRA.hooks || {};
+
+// キー入力管理
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ControlLeft', 'ControlRight', 'F2', 'PageUp', 'PageDown'].includes(e.code)) {
+    e.preventDefault();
+  }
+  handleActionInput(e.code);
+});
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+// マウス座標・クリック管理（クエスト選択画面用）
+let mouseX = -1;
+let mouseY = -1;
+let hoveredQuestIndex = -1;
+let hoveredPageBtn = -1; // 0: 前ページ, 1: 次ページ
+let questPage = 0;
+const QUESTS_PER_PAGE = 6;
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  mouseX = (e.clientX - rect.left) * scaleX;
+  mouseY = (e.clientY - rect.top) * scaleY;
+  updateHoveredQuest();
+});
+
+canvas.addEventListener('mouseleave', () => {
+  mouseX = -1;
+  mouseY = -1;
+  hoveredQuestIndex = -1;
+  hoveredPageBtn = -1;
+});
+
+canvas.addEventListener('click', e => {
+  if (isWeaknessGuideOpen) return;
+  if (isEquipMenuOpen) return;
+  if (gameState !== 'questSelect') return;
+
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  mouseX = (e.clientX - rect.left) * scaleX;
+  mouseY = (e.clientY - rect.top) * scaleY;
+  updateHoveredQuest();
+
+  const totalPages = Math.ceil(QUEST_LIST.length / QUESTS_PER_PAGE);
+  if (hoveredPageBtn === 0) {
+    questPage = (questPage + totalPages - 1) % totalPages;
+    updateHoveredQuest();
+    return;
+  }
+  if (hoveredPageBtn === 1) {
+    questPage = (questPage + 1) % totalPages;
+    updateHoveredQuest();
+    return;
+  }
+
+  if (hoveredQuestIndex >= 0 && hoveredQuestIndex < QUEST_LIST.length) {
+    startQuest(QUEST_LIST[hoveredQuestIndex].key);
+  }
+});
+
+// エフェクト・ダメージ表記
+let particles = [];
+let floatingTexts = [];
+let fireballs = [];
+let poisonClouds = []; // リオレイア用毒弾・毒霧
+let thunderOrbs = []; // ジンオウガ用雷光弾
+let thunderWaves = []; // トビカガチ用：地面を走る雷の波（雷属性）
+let waterJets = []; // タマミツネ用：直線水ブレス（泡やられ付与）
+let bubbleOrbs = []; // タマミツネ用：ふわふわ漂う泡弾（泡やられ付与）
+let lightningClouds = []; // キリン用落雷雲（1.5秒＝90フレーム後に落雷して消滅）
+let lightningBolts = [];  // 落雷の閃光エフェクト
+let frenzyOrbs = []; // ゴア・マガラ用：設置型爆発ブレス（1.5秒＝90フレーム後に爆発）
+let frenzyExplosions = []; // 爆発エフェクト
+let frenzySpreadClouds = []; // ゴア・マガラ用：拡散ブレス（設置後5秒＝300フレーム滞留、上で毎秒3ダメージ）
+let iceBeams = []; // ベリオロス用：上空からの氷ビーム
+let iceSpears = []; // ベリオロス用：横一列の氷の槍（見切り斬り対応）
+let screenShake = 0;
+
+// 武器データ定義（武器種ごと）
+const WEAPON_TYPES = [
+  { key: 'longsword', label: '太刀' },
+  { key: 'greatsword', label: '大剣' },
+  { key: 'dualblades', label: '双剣' },
+  ...(EXTRA.weaponTypes || [])
+];
+
+const WEAPON_DB = {
+  longsword: [
+    { id: 'iron_katana', type: 'longsword', name: '鉄刀', element: 'none', elementLabel: '無属性', attack: 80 },
+    { id: 'rathalos_katana', type: 'longsword', name: '飛竜刀【朱】', element: 'fire', elementLabel: '火属性', attack: 115 },
+    { id: 'zinogre_katana', type: 'longsword', name: '王牙刀【伏雷】', element: 'thunder', elementLabel: '雷属性', attack: 120 },
+    { id: 'barioth_katana', type: 'longsword', name: 'バスティンエッジ', element: 'ice', elementLabel: '氷属性', attack: 130 },
+    { id: 'gore_katana', type: 'longsword', name: 'スティールofファクト', element: 'dragon', elementLabel: '龍属性', attack: 150 },
+    ...((EXTRA.weapons && EXTRA.weapons.longsword) || [])
+  ],
+  greatsword: [
+    { id: 'iron_gs', type: 'greatsword', name: '鉄大剣', element: 'none', elementLabel: '無属性', attack: 100 },
+    { id: 'rathalos_gs', type: 'greatsword', name: '炎剣リオレウス', element: 'fire', elementLabel: '炎属性', attack: 150 },
+    { id: 'barioth_gs', type: 'greatsword', name: '暴雪剣グレツァタギオ', element: 'ice', elementLabel: '氷属性', attack: 170 },
+    { id: 'gore_gs', type: 'greatsword', name: 'プライドofダーク', element: 'dragon', elementLabel: '龍属性', attack: 200 },
+    ...((EXTRA.weapons && EXTRA.weapons.greatsword) || [])
+  ],
+  dualblades: [
+    { id: 'twin_daggers', type: 'dualblades', name: 'ツインダガー', element: 'none', elementLabel: '無属性', attack: 75 },
+    ...((EXTRA.weapons && EXTRA.weapons.dualblades) || [])
+  ]
+};
+
+// extra_content2.js で追加された新武器種の武器リストを自動登録
+(EXTRA.weaponTypes || []).forEach(wt => {
+  WEAPON_DB[wt.key] = (EXTRA.weapons && EXTRA.weapons[wt.key]) || [];
+});
+
+// クエスト一覧（基本9クエスト＋extra_content.js追加分）
+const QUEST_LIST = [
+ {
+    key: 'rathalos',
+    title: '火竜 リオレウス',
+    stars: '☆1',
+    starLevel: 1,
+    hpText: 'HP 3000',
+    themeColor: '#e53935',
+    borderColor: '#ff8a80',
+    tag: '空の王者・火属性ブレス',
+    isMultiTarget: false
+  },
+  {
+    key: 'rathian',
+    title: '雌火竜 リオレイア',
+    stars: '☆1',
+    starLevel: 1,
+    hpText: 'HP 3000',
+    themeColor: '#43a047',
+    borderColor: '#a5d6a7',
+    tag: '陸の女王・猛毒サマーソルト',
+    isMultiTarget: false
+  },
+  {
+    key: 'zinogre',
+    title: '雷狼竜 ジンオウガ',
+    stars: '☆1',
+    starLevel: 1,
+    hpText: 'HP 5000',
+    themeColor: '#00acc1',
+    borderColor: '#80deea',
+    tag: '無双の狩人・超帯電＆雷撃',
+    isMultiTarget: false
+  },
+  {
+    key: 'tobi',
+    title: '飛雷竜 トビカガチ',
+    stars: '☆1',
+    starLevel: 1,
+    hpText: 'HP 6000',
+    themeColor: '#fdd835',
+    borderColor: '#fff59d',
+    tag: '全攻撃雷属性・ひっかき/突進/雷の波',
+    isMultiTarget: false
+  },
+  {
+    key: 'gore',
+    title: '黒蝕竜 ゴア・マガラ',
+    stars: '☆2',
+    starLevel: 2,
+    hpText: 'HP 7500',
+    themeColor: '#8e24aa',
+    borderColor: '#ea80fc',
+    tag: '狂竜化・爆発＆拡散ブレス',
+    isMultiTarget: false
+  },
+  {
+    key: 'barioth',
+    title: '氷牙竜 ベリオロス',
+    stars: '☆2',
+    starLevel: 2,
+    hpText: 'HP 6000',
+    themeColor: '#00bcd4',
+    borderColor: '#84ffff',
+    tag: '氷牙竜・滑空氷ビーム＆氷の槍',
+    isMultiTarget: false
+  },
+  {
+    key: 'mizutsune',
+    title: '泡狐竜 タマミツネ',
+    stars: '☆2',
+    starLevel: 2,
+    hpText: 'HP 6500',
+    themeColor: '#ec407a',
+    borderColor: '#f8bbd0',
+    tag: '滑走ステップ・水ブレス＆泡やられ(8秒)',
+    isMultiTarget: false
+  },
+  {
+    key: 'raths_duo',
+    title: '一対の巨影',
+    stars: '☆2',
+    starLevel: 2,
+    hpText: '各HP 5000',
+    themeColor: '#ff7043',
+    borderColor: '#ffcc80',
+    tag: 'レイアHP2000以下でレウス乱入！',
+    isMultiTarget: true
+  },
+  {
+    key: 'kirin',
+    title: '幻獣 キリン',
+    stars: '☆3',
+    starLevel: 3,
+    hpText: 'HP 10000',
+    themeColor: '#29b6f6',
+    borderColor: '#b3e5fc',
+    tag: '古龍種・大放電広域落雷＆落雷召喚',
+    isMultiTarget: false
+  },
+  ...(EXTRA.quests || [])
+];
+
+// モンスター別・最大HP設定
+const MONSTER_MAX_HP = {
+  rathalos: 3000,
+  rathian:  3000,
+  zinogre:  5000,
+  tobi:     6000,
+  kirin:    10000,
+  gore:     7500,
+  barioth:  6000,
+  mizutsune: 6500,
+  raths_duo: 5000
+};
+
+// モンスター別・属性肉質（内部ダメージ倍率）
+const ELEMENT_EFFECTIVENESS = {
+  rathalos:  { fire: 0, water: 0.75, thunder: 0.75, ice: 0.75, dragon: 1.5 },
+  rathian:   { fire: 0, water: 0.75, thunder: 0.75, ice: 0.75, dragon: 1.5 },
+  zinogre:   { fire: 0.75, water: 0.75, thunder: 0, ice: 1.25, dragon: 0.25 },
+  tobi:      { fire: 1.25, water: 1.5, thunder: 0.25, ice: 0.75, dragon: 0.75 },
+  gore:      { fire: 1.5, water: 0, thunder: 1.25, ice: 0.75, dragon: 1.5 },
+  barioth:   { fire: 1.5, water: 0.25, thunder: 1.25, ice: 0.25, dragon: 0.75 },
+  mizutsune: { fire: 0.75, water: 0.25, thunder: 1.5, ice: 0.75, dragon: 1.25 },
+  raths_duo: { fire: 0, water: 0.75, thunder: 0.75, ice: 0.75, dragon: 1.5 },
+  kirin:     { fire: 1.5, water: 1.25, thunder: 0.25, ice: 1.25, dragon: 0.75 }
+};
+
+// extra_content.js による既存クエストの上書き＆追加クエストの自動登録
+if (EXTRA.questOverrides) {
+  QUEST_LIST.forEach(q => {
+    const ov = EXTRA.questOverrides[q.key];
+    if (ov) {
+      Object.assign(q, ov);
+      if (ov.maxHp) MONSTER_MAX_HP[q.key] = ov.maxHp;
+      if (ov.effectiveness) ELEMENT_EFFECTIVENESS[q.key] = ov.effectiveness;
+    }
+  });
+}
+
+(EXTRA.quests || []).forEach(eq => {
+  if (eq.maxHp) MONSTER_MAX_HP[eq.key] = eq.maxHp;
+  if (eq.effectiveness) ELEMENT_EFFECTIVENESS[eq.key] = eq.effectiveness;
+});
+
+function formatHitzoneDisplay(mult) {
+  if (mult === 0) return '✕';
+  if (mult >= 1.5) return '50';
+  if (mult >= 1.25) return '40';
+  if (mult === 1.0) return '30';
+  if (mult >= 0.75) return '25';
+  if (mult >= 0.25) return '10';
+  return '10';
+}
+
+function getElementMultiplier(monsterKey, elementKey) {
+  if (!elementKey || elementKey === 'none') return 1.0;
+  const table = ELEMENT_EFFECTIVENESS[monsterKey];
+  if (!table || table[elementKey] === undefined) return 1.0;
+  return table[elementKey];
+}
+
+// 防具データ定義（series: 'none' | 'hunter' | 'rathalos' | 'kirin' + extra_content.js）
+const ARMOR_DB = {
+  head: [
+    { id: 'none', series: 'none', name: 'なし', def: 0, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'hunter_head', series: 'hunter', name: 'ハンターヘルム', def: 5, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'rathalos_head', series: 'rathalos', name: 'レウスヘルム', def: 5, fireRes: 4, waterRes: 0, thunderRes: 0, skills: { attack: 1 } },
+    { id: 'kirin_head', series: 'kirin', name: 'キリンホーン', def: 5, fireRes: 0, waterRes: 0, thunderRes: 4, skills: { attack: 1 } },
+    ...((EXTRA.armors && EXTRA.armors.head) || [])
+  ],
+  chest: [
+    { id: 'none', series: 'none', name: 'なし', def: 0, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'hunter_chest', series: 'hunter', name: 'ハンターメイル', def: 5, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'rathalos_chest', series: 'rathalos', name: 'レウスメイル', def: 5, fireRes: 4, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'kirin_chest', series: 'kirin', name: 'キリンベスト', def: 7, fireRes: 0, waterRes: 0, thunderRes: 4, skills: { recoveryUp: 1 } },
+    ...((EXTRA.armors && EXTRA.armors.chest) || [])
+  ],
+  arms: [
+    { id: 'none', series: 'none', name: 'なし', def: 0, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'hunter_arms', series: 'hunter', name: 'ハンターアーム', def: 5, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'rathalos_arms', series: 'rathalos', name: 'レウスアーム', def: 5, fireRes: 4, waterRes: 0, thunderRes: 0, skills: { recoveryUp: 1 } },
+    { id: 'kirin_arms', series: 'kirin', name: 'キリンアーム', def: 5, fireRes: 0, waterRes: 0, thunderRes: 4, skills: { focus: 1 } },
+    ...((EXTRA.armors && EXTRA.armors.arms) || [])
+  ],
+  waist: [
+    { id: 'none', series: 'none', name: 'なし', def: 0, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'hunter_waist', series: 'hunter', name: 'ハンターコイル', def: 5, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'rathalos_waist', series: 'rathalos', name: 'レウスコイル', def: 5, fireRes: 4, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'kirin_waist', series: 'kirin', name: 'キリンフープ', def: 5, fireRes: 0, waterRes: 0, thunderRes: 4, skills: {} },
+    ...((EXTRA.armors && EXTRA.armors.waist) || [])
+  ],
+  legs: [
+    { id: 'none', series: 'none', name: 'なし', def: 0, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'hunter_legs', series: 'hunter', name: 'ハンターグリーヴ', def: 5, fireRes: 0, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'rathalos_legs', series: 'rathalos', name: 'レウスグリーヴ', def: 5, fireRes: 4, waterRes: 0, thunderRes: 0, skills: {} },
+    { id: 'kirin_legs', series: 'kirin', name: 'キリンレガース', def: 7, fireRes: 0, waterRes: 0, thunderRes: 4, skills: { thunderAtk: 1 } },
+    ...((EXTRA.armors && EXTRA.armors.legs) || [])
+  ]
+};
+
+const SKILL_NAMES = {
+  attack: '攻撃',
+  recoveryUp: '回復量増加',
+  focus: '溜め時間減少',
+  fireAtk: '火属性ダメージ',
+  waterAtk: '水属性ダメージ',
+  thunderAtk: '雷属性ダメージ',
+  iceAtk: '氷属性ダメージ',
+  dragonAtk: '龍属性ダメージ',
+  bubblyDance: '泡沫の舞',
+  ...(EXTRA.skillNames || {})
+};
+
+const EQUIP_SLOTS = [
+  { key: 'weapon', label: '武器' },
+  { key: 'head', label: '頭' },
+  { key: 'chest', label: '胴' },
+  { key: 'arms', label: '腕' },
+  { key: 'waist', label: '腰' },
+  { key: 'legs', label: '脚' }
+];
+
+const ARMOR_SLOTS = EQUIP_SLOTS.filter(s => s.key !== 'weapon');
+
+let isEquipMenuOpen = false;
+let isWeaknessGuideOpen = false;
+let weaknessPage = 0;
+const WEAKNESS_PER_PAGE = 6;
+let equipCursor = 0;
+
+// プレイヤー（装備・太刀 / 大剣 / 双剣 / 新武器種）
+const player = {
+  x: 180, y: GROUND_Y, w: 30, h: 60,
+  vx: 0, vy: 0,
+  facing: 1,
+  hp: 100, maxHp: 100,
+  stamina: 100, maxStamina: 100,
+  spirit: 0, maxSpirit: 100,
+  spiritLevel: 0,
+  spiritTimer: 0,
+  chargeFrames: 0,
+  chargeLevel: 0,
+  demonMode: false,         // 双剣：鬼人化状態
+  bubblyBuffTimer: 0,       // 泡沫の舞：攻撃力1.05倍バフ（30秒＝1800フレーム）
+  potions: 10,              // 回復薬
+  megaPotions: 10,          // 回復薬グレート（回復薬の1.5倍回復）
+  antidotes: 10,            // 解毒薬
+  burnTimer: 0,             // 火属性やられ
+  thunderBlightTimer: 0,    // 雷属性やられ（効果：雷属性ダメージの被ダメ+5）
+  bubbleTimer: 0,           // 泡やられ（8秒＝480フレームで解除・重複延長なし）
+  poisonTimer: 0,           // 毒状態
+  paralysisTimer: 0,        // 麻痺状態（60fps換算で180＝3秒）
+  frenzyCloudTick: 0,
+  invulnTimer: 0,
+  weaponType: 'longsword',
+  weaponIndices: {
+    longsword: 0,
+    greatsword: 0,
+    dualblades: 0
+  },
+  equipment: {
+    head: 0,
+    chest: 0,
+    arms: 0,
+    waist: 0,
+    legs: 0
+  },
+  state: 'idle',
+  stateTimer: 0,
+  attackHitbox: null,
+  hasHitThisSwing: false,
+  foresightSuccess: false
+};
+
+// 新武器種の装備インデックスを自動初期化
+(EXTRA.weaponTypes || []).forEach(wt => {
+  player.weaponIndices[wt.key] = 0;
+});
+
+// 外部フックへ渡すコンテキストオブジェクト
+function getHookContext() {
+  return {
+    canvas,
+    ctx,
+    GROUND_Y,
+    GRAVITY,
+    player,
+    activeMonsters,
+    particles,
+    floatingTexts,
+    keys,
+    addText,
+    addParticles,
+    damagePlayer,
+    rectIntersect,
+    getMonsterBody,
+    getCurrentWeapon,
+    computeWeaponHitDamage,
+    resetMonsterSwingHitFlags,
+    get screenShake() { return screenShake; },
+    set screenShake(v) { screenShake = v; }
+  };
+}
+
+function updateControlsInfo() {
+  const customType = (EXTRA.weaponTypes || []).find(t => t.key === player.weaponType);
+  const isGS = player.weaponType === 'greatsword';
+  const isDB = player.weaponType === 'dualblades';
+  const weaponActions = customType && customType.controlsHtml
+    ? customType.controlsHtml
+    : (isGS
+      ? `縦斬り: <span class="key">J</span>/<span class="key">Z</span> ｜ 溜め斬り: <span class="key">K</span>/<span class="key">X</span> ｜ タックル: <span class="key">L</span>/<span class="key">C</span>`
+      : (isDB
+        ? `二段乱舞: <span class="key">J</span>/<span class="key">Z</span> ｜ 鬼人化: <span class="key">K</span>/<span class="key">X</span> ｜ 鬼人突進連斬: <span class="key">L</span>/<span class="key">C</span>`
+        : `通常斬り: <span class="key">J</span>/<span class="key">Z</span> ｜ 気刃斬り: <span class="key">K</span>/<span class="key">X</span> ｜ 見切り斬り: <span class="key">L</span>/<span class="key">C</span>`));
+
+  controlsInfoEl.innerHTML =
+    `移動: <span class="key">A</span><span class="key">D</span>/<span class="key">←</span><span class="key">→</span> ｜ ` +
+    `跳躍: <span class="key">W</span>/<span class="key">Space</span> ｜ ` +
+    `${weaponActions} ｜ ` +
+    `回避: <span class="key">Shift</span> ｜ ` +
+    `回復/グレート/解毒: <span class="key">H</span>/<span class="key">B</span>/<span class="key">G</span> ｜ ` +
+    `装備: <span class="key">Ctrl</span> ｜ ` +
+    `弱点表: <span class="key">F2</span> ｜ ` +
+    `クエスト選択: <span class="key">M</span>`;
+}
+updateControlsInfo();
+
+function getCurrentWeapon() {
+  const list = WEAPON_DB[player.weaponType] || WEAPON_DB.longsword;
+  const idx = player.weaponIndices[player.weaponType] || 0;
+  return list[idx] || list[0] || { id: 'none', type: player.weaponType, name: '素手', element: 'none', elementLabel: '無属性', attack: 80 };
+}
+
+function getWeaponTypeLabel() {
+  const found = WEAPON_TYPES.find(t => t.key === player.weaponType);
+  return found ? found.label : '太刀';
+}
+
+function getAttackSkillBonus() {
+  const skills = getActiveSkills();
+  const lv = skills.attack || 0;
+  if (lv <= 0) return 0;
+  if (lv === 1) return 3;
+  if (lv === 2) return 5;
+  return 10;
+}
+
+function getElementSkillBonus(elementKey) {
+  if (!elementKey || elementKey === 'none') return 0;
+  const skillMap = {
+    fire: 'fireAtk',
+    water: 'waterAtk',
+    thunder: 'thunderAtk',
+    ice: 'iceAtk',
+    dragon: 'dragonAtk'
+  };
+  const skillKey = skillMap[elementKey];
+  if (!skillKey) return 0;
+  const skills = getActiveSkills();
+  const lv = skills[skillKey] || 0;
+  if (lv <= 0) return 0;
+  if (lv === 1) return 5;
+  if (lv === 2) return 10;
+  return 20;
+}
+
+function getThunderSkillBonus() {
+  return getElementSkillBonus('thunder');
+}
+
+function getMaxChargeFrames() {
+  const skills = getActiveSkills();
+  const lv = skills.focus || 0;
+  if (lv <= 0) return 76;
+  if (lv === 1) return 108;
+  if (lv === 2) return 90;
+  return 60;
+}
+
+function getTotalAttack() {
+  const wpn = getCurrentWeapon();
+  const elemBonus = getElementSkillBonus(wpn.element);
+  const rawAtk = wpn.attack + getAttackSkillBonus() + elemBonus;
+  const bubblyMult = player.bubblyBuffTimer > 0 ? 1.05 : 1.0;
+  return Math.round(rawAtk * bubblyMult);
+}
+
+function getTotalDefense() {
+  let def = 0;
+  for (const slot of ARMOR_SLOTS) {
+    const idx = player.equipment[slot.key];
+    def += ARMOR_DB[slot.key][idx].def;
+  }
+  return def;
+}
+
+function getTotalFireRes() {
+  let res = 0;
+  for (const slot of ARMOR_SLOTS) {
+    const idx = player.equipment[slot.key];
+    res += ARMOR_DB[slot.key][idx].fireRes || 0;
+  }
+  return res;
+}
+
+function getTotalWaterRes() {
+  let res = 0;
+  for (const slot of ARMOR_SLOTS) {
+    const idx = player.equipment[slot.key];
+    res += ARMOR_DB[slot.key][idx].waterRes || 0;
+  }
+  return res;
+}
+
+function getTotalThunderRes() {
+  let res = 0;
+  for (const slot of ARMOR_SLOTS) {
+    const idx = player.equipment[slot.key];
+    res += ARMOR_DB[slot.key][idx].thunderRes || 0;
+  }
+  return res;
+}
+
+function getActiveSkills() {
+  const totals = {};
+  for (const slot of ARMOR_SLOTS) {
+    const idx = player.equipment[slot.key];
+    const skills = ARMOR_DB[slot.key][idx].skills || {};
+    for (const [k, v] of Object.entries(skills)) {
+      totals[k] = (totals[k] || 0) + v;
+    }
+  }
+  return totals;
+}
+
+function formatSkillsText(skillsObj) {
+  const parts = [];
+  for (const [k, lv] of Object.entries(skillsObj)) {
+    if (lv > 0) {
+      parts.push(`${SKILL_NAMES[k] || k}Lv${lv}`);
+    }
+  }
+  return parts.join(' ');
+}
+
+function getEquipSummaryText() {
+  let equippedCount = 0;
+  let hunterCount = 0;
+  let rathalosCount = 0;
+  let kirinCount = 0;
+  let mizutsuneCount = 0;
+  for (const slot of ARMOR_SLOTS) {
+    const item = ARMOR_DB[slot.key][player.equipment[slot.key]];
+    if (item.series !== 'none') equippedCount++;
+    if (item.series === 'hunter') hunterCount++;
+    if (item.series === 'rathalos') rathalosCount++;
+    if (item.series === 'kirin') kirinCount++;
+    if (item.series === 'mizutsune') mizutsuneCount++;
+  }
+  const def = getTotalDefense();
+  const fireRes = getTotalFireRes();
+  const waterRes = getTotalWaterRes();
+  const thunderRes = getTotalThunderRes();
+  const resParts = [];
+  if (fireRes > 0) resParts.push(`火${fireRes}`);
+  if (waterRes > 0) resParts.push(`水${waterRes}`);
+  if (thunderRes > 0) resParts.push(`雷${thunderRes}`);
+  const resText = resParts.length > 0 ? `/${resParts.join('・')}` : '';
+
+  if (equippedCount === 0) return 'なし (防御0)';
+  if (hunterCount === 5) return `ハンター一式 (防御${def})`;
+  if (rathalosCount === 5) return `レウス一式 (防御${def}${resText})`;
+  if (kirinCount === 5) return `キリン一式 (防御${def}${resText})`;
+  if (mizutsuneCount === 5) return `ミツネ一式 (防御${def}${resText})`;
+  return `防具×${equippedCount}部位 (防御${def}${resText})`;
+}
+
+// 討伐対象クエストキー
+let targetMonster = 'rathalos';
+
+function createMonsterEntity(species, xPos = 680) {
+  const maxHp = MONSTER_MAX_HP[targetMonster] || MONSTER_MAX_HP[species] || 3000;
+  return {
+    species,
+    x: xPos, y: GROUND_Y, w: 110, h: 95,
+    vx: 0, vy: 0,
+    facing: -1,
+    hp: maxHp, maxHp: maxHp,
+    isFlying: false,
+    isCharged: false,
+    isFrenzied: false,
+    frenzyDamageTaken: 0,
+    frenzyCooldown: 0,
+    bariothBeamCount: 1,
+    bariothBeamsFired: 0,
+    targetY: GROUND_Y,
+    state: 'idle',
+    stateTimer: 60,
+    somersaultAngle: 0,
+    attackHitbox: null,
+    isPoisonAttack: false,
+    isElectricAttack: false,
+    isBubbleAttack: false,
+    hasHitThisAttack: false,
+    hasHitThisSwingByPlayer: false,
+    flashTimer: 0
+  };
+}
+
+let activeMonsters = [createMonsterEntity('rathalos')];
+let duoRathalosSpawned = false;
+
+let gameState = 'questSelect'; // questSelect, playing, win, lose
+
+// クエスト選択カードの座標レイアウト計算（2列×3行）
+function getQuestCardRect(slotIdxOnPage) {
+  const cols = 2;
+  const cardW = 395;
+  const cardH = 92;
+  const gapX = 26;
+  const gapY = 16;
+  const startX = (canvas.width - (cardW * cols + gapX)) / 2;
+  const startY = 112;
+  const col = slotIdxOnPage % cols;
+  const row = Math.floor(slotIdxOnPage / cols);
+  return {
+    x: startX + col * (cardW + gapX),
+    y: startY + row * (cardH + gapY),
+    w: cardW,
+    h: cardH
+  };
+}
+
+// ページ切替ボタン座標（0: ◀ 前へ, 1: 次へ ▶）
+function getPageBtnRects() {
+  return [
+    { x: 650, y: 72, w: 86, h: 28 },
+    { x: 782, y: 72, w: 86, h: 28 }
+  ];
+}
+
+function updateHoveredQuest() {
+  if (gameState !== 'questSelect' || isWeaknessGuideOpen || isEquipMenuOpen) {
+    hoveredQuestIndex = -1;
+    hoveredPageBtn = -1;
+    canvas.style.cursor = 'default';
+    return;
+  }
+
+  let foundBtn = -1;
+  const btnRects = getPageBtnRects();
+  for (let b = 0; b < btnRects.length; b++) {
+    const br = btnRects[b];
+    if (mouseX >= br.x && mouseX <= br.x + br.w && mouseY >= br.y && mouseY <= br.y + br.h) {
+      foundBtn = b;
+      break;
+    }
+  }
+  hoveredPageBtn = foundBtn;
+
+  let foundCard = -1;
+  const pageStart = questPage * QUESTS_PER_PAGE;
+  const pageEnd = Math.min(QUEST_LIST.length, pageStart + QUESTS_PER_PAGE);
+  for (let i = pageStart; i < pageEnd; i++) {
+    const slotIdx = i - pageStart;
+    const r = getQuestCardRect(slotIdx);
+    if (mouseX >= r.x && mouseX <= r.x + r.w && mouseY >= r.y && mouseY <= r.y + r.h) {
+      foundCard = i;
+      break;
+    }
+  }
+  hoveredQuestIndex = foundCard;
+  canvas.style.cursor = (foundCard >= 0 || foundBtn >= 0) ? 'pointer' : 'default';
+}
+
+function startQuest(monsterKey) {
+  targetMonster = monsterKey;
+  canvas.style.cursor = 'default';
+  resetGame();
+}
+
+function openQuestSelect() {
+  isEquipMenuOpen = false;
+  gameState = 'questSelect';
+  updateHoveredQuest();
+}
+
+function addText(text, x, y, color = '#fff', size = 20) {
+  floatingTexts.push({ text, x, y, color, size, life: 45 });
+}
+
+function addParticles(x, y, color, count = 10, speed = 5) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * speed * 2,
+      vy: (Math.random() - 0.5) * speed * 2,
+      color,
+      life: 20 + Math.random() * 15,
+      size: 2 + Math.random() * 4
+    });
+  }
+}
+
+function spawnLightningCloud(targetX) {
+  const clampedX = Math.max(40, Math.min(canvas.width - 40, targetX));
+  lightningClouds.push({
+    x: clampedX,
+    y: GROUND_Y - 190,
+    timer: 90
+  });
+}
+
+function spawnThunderWave(m) {
+  const startX = m.facing === 1 ? m.x + m.w : m.x - 36;
+  thunderWaves.push({
+    x: startX,
+    y: GROUND_Y - 38,
+    w: 36,
+    h: 38,
+    vx: m.facing * 8.2,
+    hasHit: false
+  });
+  addParticles(startX + 18, GROUND_Y - 16, '#ffee58', 14, 5);
+}
+
+function spawnWaterJet(m) {
+  const mouthX = m.facing === 1 ? m.x + m.w : m.x;
+  const mouthY = m.y - 54;
+  waterJets.push({
+    x: mouthX,
+    y: mouthY,
+    vx: m.facing * 9.2,
+    vy: 0,
+    r: 16,
+    hasHit: false
+  });
+  addParticles(mouthX, mouthY, '#4fc3f7', 14, 5);
+}
+
+function spawnBubbleOrbs(m) {
+  const mouthX = m.facing === 1 ? m.x + m.w : m.x;
+  const mouthY = m.y - 58;
+  for (let k = 0; k < 3; k++) {
+    bubbleOrbs.push({
+      x: mouthX,
+      y: mouthY - k * 14,
+      vx: m.facing * (4.2 + k * 1.1),
+      vy: -2.2 - k * 0.6,
+      r: 15,
+      phase: k * 1.4,
+      life: 240
+    });
+  }
+  addParticles(mouthX, mouthY, '#f8bbd0', 14, 4);
+}
+
+function spawnFrenzyBomb(targetX) {
+  const clampedX = Math.max(45, Math.min(canvas.width - 45, targetX));
+  frenzyOrbs.push({
+    x: clampedX,
+    y: GROUND_Y - 22,
+    r: 18,
+    timer: 90
+  });
+}
+
+function spawnFrenzySpreadCloud(centerX, isFrenzied) {
+  const width = isFrenzied ? 230 : 170;
+  const clampedCenter = Math.max(width / 2 + 20, Math.min(canvas.width - width / 2 - 20, centerX));
+  frenzySpreadClouds.push({
+    x: clampedCenter - width / 2,
+    y: GROUND_Y - 34,
+    w: width,
+    h: 34,
+    timer: 300,
+    maxTimer: 300
+  });
+  addParticles(clampedCenter, GROUND_Y - 18, '#aa00ff', 22, 6);
+}
+
+function spawnBariothIceBeam(m) {
+  const mouthX = m.facing === 1 ? m.x + m.w : m.x;
+  const mouthY = m.y - 52;
+  const targetX = player.x + player.w / 2;
+  const targetY = GROUND_Y;
+  iceBeams.push({
+    x1: mouthX,
+    y1: mouthY,
+    x2: targetX,
+    y2: targetY,
+    life: 20,
+    maxLife: 20,
+    hasHit: false
+  });
+  screenShake = Math.max(screenShake, 7);
+  addParticles(targetX, GROUND_Y - 8, '#80deea', 20, 6);
+}
+
+function spawnBariothIceSpear(m) {
+  const fromRight = (m.x + m.w / 2) >= canvas.width / 2;
+  const dir = fromRight ? -1 : 1;
+  const spearW = 135;
+  const spearH = 22;
+  const startX = fromRight ? canvas.width - 20 : 20 - spearW;
+  const y = GROUND_Y - 46;
+
+  iceSpears.push({
+    x: startX,
+    y: y,
+    w: spearW,
+    h: spearH,
+    vx: dir * 13.5,
+    dir: dir,
+    windupTimer: 32,
+    hasHit: false
+  });
+  addParticles(fromRight ? canvas.width - 40 : 40, y + spearH / 2, '#b2ebf2', 16, 5);
+}
+
+// アクション入力
+function handleActionInput(code) {
+  if (code === 'F2') {
+    isWeaknessGuideOpen = !isWeaknessGuideOpen;
+    if (isWeaknessGuideOpen) {
+      isEquipMenuOpen = false;
+      const singleMonsters = QUEST_LIST.filter(q => !q.isMultiTarget);
+      const activeIdx = singleMonsters.findIndex(q => activeMonsters.some(m => m.hp > 0 && m.species === q.key));
+      if (gameState === 'playing' && activeIdx >= 0) {
+        weaknessPage = Math.floor(activeIdx / WEAKNESS_PER_PAGE);
+      } else {
+        const totalWP = Math.max(1, Math.ceil(singleMonsters.length / WEAKNESS_PER_PAGE));
+        if (weaknessPage >= totalWP) weaknessPage = 0;
+      }
+    }
+    updateHoveredQuest();
+    return;
+  }
+
+  if (isWeaknessGuideOpen) {
+    const singleMonsters = QUEST_LIST.filter(q => !q.isMultiTarget);
+    const totalWeaknessPages = Math.max(1, Math.ceil(singleMonsters.length / WEAKNESS_PER_PAGE));
+    if (code === 'Escape') {
+      isWeaknessGuideOpen = false;
+      updateHoveredQuest();
+    } else if (code === 'ArrowRight' || code === 'KeyD' || code === 'KeyE' || code === 'PageDown') {
+      weaknessPage = (weaknessPage + 1) % totalWeaknessPages;
+    } else if (code === 'ArrowLeft' || code === 'KeyA' || code === 'KeyQ' || code === 'PageUp') {
+      weaknessPage = (weaknessPage + totalWeaknessPages - 1) % totalWeaknessPages;
+    }
+    return;
+  }
+
+  if (code === 'ControlLeft' || code === 'ControlRight') {
+    if (gameState === 'playing' || gameState === 'questSelect') {
+      isEquipMenuOpen = !isEquipMenuOpen;
+      updateHoveredQuest();
+    }
+    return;
+  }
+
+  if (isEquipMenuOpen) {
+    if (code === 'Escape') {
+      isEquipMenuOpen = false;
+      updateHoveredQuest();
+      return;
+    }
+    if (code === 'ArrowUp' || code === 'KeyW') {
+      equipCursor = (equipCursor + EQUIP_SLOTS.length - 1) % EQUIP_SLOTS.length;
+    } else if (code === 'ArrowDown' || code === 'KeyS') {
+      equipCursor = (equipCursor + 1) % EQUIP_SLOTS.length;
+    } else if (code === 'Enter') {
+      const slotKey = EQUIP_SLOTS[equipCursor].key;
+      if (slotKey === 'weapon') {
+        const typeOrder = WEAPON_TYPES.map(t => t.key);
+        const nextIdx = (typeOrder.indexOf(player.weaponType) + 1) % typeOrder.length;
+        player.weaponType = typeOrder[nextIdx];
+        player.state = 'idle';
+        player.attackHitbox = null;
+        player.chargeFrames = 0;
+        player.chargeLevel = 0;
+        player.demonMode = false;
+        if (typeof EXTRA_HOOKS.onSwitchWeapon === 'function') {
+          EXTRA_HOOKS.onSwitchWeapon(getHookContext());
+        }
+        updateControlsInfo();
+      }
+    } else if (code === 'ArrowLeft' || code === 'KeyA') {
+      const slotKey = EQUIP_SLOTS[equipCursor].key;
+      if (slotKey === 'weapon') {
+        const list = WEAPON_DB[player.weaponType] || WEAPON_DB.longsword;
+        player.weaponIndices[player.weaponType] = ((player.weaponIndices[player.weaponType] || 0) + list.length - 1) % list.length;
+      } else {
+        const listLen = ARMOR_DB[slotKey].length;
+        player.equipment[slotKey] = (player.equipment[slotKey] + listLen - 1) % listLen;
+      }
+    } else if (code === 'ArrowRight' || code === 'KeyD' || code === 'Space' || code === 'KeyJ' || code === 'KeyZ') {
+      const slotKey = EQUIP_SLOTS[equipCursor].key;
+      if (slotKey === 'weapon') {
+        const list = WEAPON_DB[player.weaponType] || WEAPON_DB.longsword;
+        player.weaponIndices[player.weaponType] = ((player.weaponIndices[player.weaponType] || 0) + 1) % list.length;
+      } else {
+        const listLen = ARMOR_DB[slotKey].length;
+        player.equipment[slotKey] = (player.equipment[slotKey] + 1) % listLen;
+      }
+    }
+    return;
+  }
+
+  if (gameState === 'questSelect') {
+    const totalPages = Math.ceil(QUEST_LIST.length / QUESTS_PER_PAGE);
+    if (code === 'KeyQ' || code === 'PageUp') {
+      questPage = (questPage + totalPages - 1) % totalPages;
+      hoveredQuestIndex = questPage * QUESTS_PER_PAGE;
+      return;
+    } else if (code === 'KeyE' || code === 'PageDown') {
+      questPage = (questPage + 1) % totalPages;
+      hoveredQuestIndex = questPage * QUESTS_PER_PAGE;
+      return;
+    }
+
+    const pageStart = questPage * QUESTS_PER_PAGE;
+    const pageEnd = Math.min(QUEST_LIST.length, pageStart + QUESTS_PER_PAGE);
+    if (code === 'ArrowRight' || code === 'KeyD') {
+      if (hoveredQuestIndex < pageStart || hoveredQuestIndex >= pageEnd) {
+        hoveredQuestIndex = pageStart;
+      } else if (hoveredQuestIndex + 1 < pageEnd) {
+        hoveredQuestIndex++;
+      } else {
+        questPage = (questPage + 1) % totalPages;
+        hoveredQuestIndex = questPage * QUESTS_PER_PAGE;
+      }
+    } else if (code === 'ArrowLeft' || code === 'KeyA') {
+      if (hoveredQuestIndex < pageStart || hoveredQuestIndex >= pageEnd) {
+        hoveredQuestIndex = pageStart;
+      } else if (hoveredQuestIndex - 1 >= pageStart) {
+        hoveredQuestIndex--;
+      } else {
+        questPage = (questPage + totalPages - 1) % totalPages;
+        hoveredQuestIndex = Math.min(QUEST_LIST.length - 1, questPage * QUESTS_PER_PAGE + QUESTS_PER_PAGE - 1);
+      }
+    } else if (code === 'ArrowDown' || code === 'KeyS') {
+      if (hoveredQuestIndex < pageStart || hoveredQuestIndex >= pageEnd) {
+        hoveredQuestIndex = pageStart;
+      } else if (hoveredQuestIndex + 2 < pageEnd) {
+        hoveredQuestIndex += 2;
+      }
+    } else if (code === 'ArrowUp' || code === 'KeyW') {
+      if (hoveredQuestIndex < pageStart || hoveredQuestIndex >= pageEnd) {
+        hoveredQuestIndex = pageStart;
+      } else if (hoveredQuestIndex - 2 >= pageStart) {
+        hoveredQuestIndex -= 2;
+      }
+    } else if ((code === 'Enter' || code === 'Space') && hoveredQuestIndex >= 0) {
+      startQuest(QUEST_LIST[hoveredQuestIndex].key);
+    }
+    return;
+  }
+
+  if (code === 'KeyM') {
+    openQuestSelect();
+    return;
+  }
+
+  if (gameState !== 'playing') {
+    if (code === 'KeyR') resetGame();
+    return;
+  }
+
+  if (player.paralysisTimer > 0) return;
+
+  // 緊急回避
+  if ((code === 'ShiftLeft' || code === 'ShiftRight') && ['idle', 'run', 'jump'].includes(player.state) && player.stamina >= 25) {
+    player.state = 'dodge';
+    player.stateTimer = 18;
+    player.invulnTimer = 14;
+    player.stamina -= 25;
+    player.vx = player.facing * 9;
+    if (player.burnTimer > 0) player.burnTimer = Math.max(0, player.burnTimer - 120);
+    if (player.thunderBlightTimer > 0) player.thunderBlightTimer = Math.max(0, player.thunderBlightTimer - 120);
+  }
+
+  // 回復薬（Hキー）
+  if (code === 'KeyH' && player.potions > 0 && player.hp < player.maxHp && ['idle', 'run'].includes(player.state)) {
+    player.potions--;
+    const skills = getActiveSkills();
+    const recLv = Math.min(3, skills.recoveryUp || 0);
+    const healAmounts = [45, 52, 60, 70];
+    const heal = healAmounts[recLv];
+    player.hp = Math.min(player.maxHp, player.hp + heal);
+    addText(`+${heal} 回復!`, player.x, player.y - 70, '#4eff4e', 18);
+    addParticles(player.x + 15, player.y - 30, '#4eff4e', 12, 3);
+  }
+
+  // 回復薬グレート（Bキー・回復薬の1.5倍回復）
+  if (code === 'KeyB' && player.megaPotions > 0 && player.hp < player.maxHp && ['idle', 'run'].includes(player.state)) {
+    player.megaPotions--;
+    const skills = getActiveSkills();
+    const recLv = Math.min(3, skills.recoveryUp || 0);
+    const megaHealAmounts = [68, 78, 90, 100];
+    const heal = megaHealAmounts[recLv];
+    player.hp = Math.min(player.maxHp, player.hp + heal);
+    addText(`+${heal} 大回復!`, player.x - 6, player.y - 72, '#00e676', 20);
+    addParticles(player.x + 15, player.y - 30, '#00e676', 18, 4);
+  }
+
+  // 解毒薬（Gキー）
+  if (code === 'KeyG' && player.antidotes > 0 && player.poisonTimer > 0 && ['idle', 'run'].includes(player.state)) {
+    player.antidotes--;
+    player.poisonTimer = 0;
+    addText('毒解除！', player.x, player.y - 70, '#55aaff', 18);
+    addParticles(player.x + 15, player.y - 30, '#55aaff', 12, 3);
+  }
+
+  // 新武器種のアクション入力フック
+  const isCustomWeapon = (EXTRA.weaponTypes || []).some(t => t.key === player.weaponType);
+  if (isCustomWeapon) {
+    if (typeof EXTRA_HOOKS.onPlayerAction === 'function') {
+      EXTRA_HOOKS.onPlayerAction(code, getHookContext());
+    }
+    return;
+  }
+
+  const isGS = player.weaponType === 'greatsword';
+  const isDB = player.weaponType === 'dualblades';
+
+  if (isGS) {
+    if ((code === 'KeyJ' || code === 'KeyZ') && ['idle', 'run', 'jump'].includes(player.state)) {
+      player.state = 'attack';
+      player.stateTimer = 26;
+      resetMonsterSwingHitFlags();
+    }
+
+    if ((code === 'KeyK' || code === 'KeyX') && ['idle', 'run', 'attack'].includes(player.state)) {
+      player.state = 'gsCharge';
+      player.chargeFrames = 0;
+      player.chargeLevel = 0;
+      player.attackHitbox = null;
+    }
+
+    if ((code === 'KeyL' || code === 'KeyC') && ['idle', 'run', 'attack', 'gsCharge'].includes(player.state) && player.stamina >= 20) {
+      player.state = 'gsTackle';
+      player.stateTimer = 18;
+      player.stamina -= 20;
+      resetMonsterSwingHitFlags();
+      player.vx = player.facing * 8.5;
+    }
+  } else if (isDB) {
+    // 双剣：J/Z 二段乱舞（2〜3回ランダムヒット）
+    if ((code === 'KeyJ' || code === 'KeyZ') && ['idle', 'run', 'jump'].includes(player.state)) {
+      player.state = 'dbSlash';
+      player.stateTimer = 16;
+      resetMonsterSwingHitFlags();
+      player.vx = player.facing * (player.demonMode ? 4.5 : 2.5);
+    }
+
+    // 双剣：K/X 鬼人化ON/OFF切替
+    if ((code === 'KeyK' || code === 'KeyX') && ['idle', 'run', 'jump', 'dbSlash'].includes(player.state)) {
+      if (!player.demonMode && player.stamina >= 15) {
+        player.demonMode = true;
+        addText('鬼人化！！', player.x - 10, player.y - 78, '#ff5252', 19);
+        addParticles(player.x + 15, player.y - 35, '#ff1744', 18, 5);
+      } else if (player.demonMode) {
+        player.demonMode = false;
+        addText('鬼人化解除', player.x - 10, player.y - 75, '#cfd8dc', 16);
+      }
+    }
+
+    // 双剣：L/C 鬼人突進連斬（2〜3回ランダムヒット）
+    if ((code === 'KeyL' || code === 'KeyC') && ['idle', 'run', 'jump', 'dbSlash'].includes(player.state) && player.stamina >= 20) {
+      player.state = 'dbSpinDash';
+      player.stateTimer = 20;
+      player.stamina -= 20;
+      resetMonsterSwingHitFlags();
+      player.vx = player.facing * (player.demonMode ? 11.5 : 9.2);
+    }
+  } else {
+    if ((code === 'KeyJ' || code === 'KeyZ') && ['idle', 'run', 'jump'].includes(player.state)) {
+      player.state = 'attack';
+      player.stateTimer = 18;
+      resetMonsterSwingHitFlags();
+    }
+
+    if ((code === 'KeyK' || code === 'KeyX') && ['idle', 'run', 'attack'].includes(player.state) && player.spirit >= 30) {
+      player.state = 'spiritAttack';
+      player.stateTimer = 24;
+      player.spirit -= 30;
+      resetMonsterSwingHitFlags();
+    }
+
+    if ((code === 'KeyL' || code === 'KeyC') && ['idle', 'run', 'attack'].includes(player.state) && player.spirit >= 10) {
+      player.state = 'foresight';
+      player.stateTimer = 26;
+      player.spirit = 0;
+      player.foresightSuccess = false;
+      resetMonsterSwingHitFlags();
+      player.vx = -player.facing * 6;
+    }
+  }
+}
+
+function resetMonsterSwingHitFlags() {
+  player.hasHitThisSwing = false;
+  activeMonsters.forEach(m => {
+    m.hasHitThisSwingByPlayer = false;
+  });
+}
+
+function computeWeaponHitDamage(baseMotionValue, weapon, auraMult = 1.0, monsterSpecies = targetMonster) {
+  const basePlusAtkSkill = weapon.attack + getAttackSkillBonus();
+  const bubblyMult = player.bubblyBuffTimer > 0 ? 1.05 : 1.0;
+
+  if (!weapon.element || weapon.element === 'none') {
+    const rawTotal = baseMotionValue * (basePlusAtkSkill / 80) * auraMult * bubblyMult;
+    return { dmg: Math.max(1, Math.round(rawTotal)), elemMult: 1.0 };
+  }
+
+  const elemMult = getElementMultiplier(monsterSpecies, weapon.element);
+  const elemBonus = getElementSkillBonus(weapon.element);
+  const combinedAtk = basePlusAtkSkill + elemBonus;
+
+  if (elemMult === 0) {
+    const physOnly = baseMotionValue * (basePlusAtkSkill / 80) * auraMult * bubblyMult * 0.75;
+    return { dmg: Math.max(1, Math.round(physOnly)), elemMult };
+  }
+
+  if (elemMult >= 1.25) {
+    const scaled = baseMotionValue * (combinedAtk / 80) * auraMult * bubblyMult * elemMult;
+    return { dmg: Math.max(1, Math.round(scaled)), elemMult };
+  }
+
+  const rawCombined = baseMotionValue * (combinedAtk / 80) * auraMult * bubblyMult;
+  const physPart = rawCombined * 0.75;
+  const elemPart = rawCombined * 0.25 * elemMult;
+  return { dmg: Math.max(1, Math.round(physPart + elemPart)), elemMult };
+}
+
+function updatePlayer() {
+  const isCustomWeapon = (EXTRA.weaponTypes || []).some(t => t.key === player.weaponType);
+  if (isCustomWeapon && typeof EXTRA_HOOKS.onUpdatePlayer === 'function') {
+    const handled = EXTRA_HOOKS.onUpdatePlayer(getHookContext());
+    if (handled) return;
+  }
+
+  const isGS = player.weaponType === 'greatsword';
+  const isDB = player.weaponType === 'dualblades';
+
+  if (!isDB) {
+    player.demonMode = false;
+  }
+
+  // 双剣の鬼人化中はスタミナを徐々に消費（スタミナ切れで自動解除）
+  if (player.demonMode) {
+    player.stamina = Math.max(0, player.stamina - 0.28);
+    if (Math.random() < 0.35) {
+      addParticles(player.x + 15, player.y - 30, '#ff1744', 1, 2.2);
+    }
+    if (player.stamina <= 0) {
+      player.demonMode = false;
+      addText('スタミナ切れ・鬼人解除', player.x - 20, player.y - 75, '#ff8a80', 16);
+    }
+  } else if (player.state !== 'dodge' && player.state !== 'gsTackle' && player.state !== 'dbSpinDash') {
+    player.stamina = Math.min(player.maxStamina, player.stamina + 0.35);
+  }
+
+  if (player.spiritLevel > 0) {
+    player.spiritTimer--;
+    if (player.spiritTimer <= 0) {
+      player.spiritLevel--;
+      player.spiritTimer = player.spiritLevel > 0 ? 900 : 0;
+    }
+  }
+
+  if (player.bubblyBuffTimer > 0) {
+    player.bubblyBuffTimer--;
+    if (player.bubblyBuffTimer % 20 === 0) {
+      addParticles(player.x + 15, player.y - 40, '#80deea', 1, 2);
+    }
+  }
+
+  if (player.burnTimer > 0) {
+    player.burnTimer--;
+    if (player.burnTimer % 30 === 0) {
+      player.hp = Math.max(1, player.hp - 2);
+      addParticles(player.x + 15, player.y - 30, '#ff4500', 3, 2);
+    }
+  }
+
+  if (player.thunderBlightTimer > 0) {
+    player.thunderBlightTimer--;
+    if (player.thunderBlightTimer % 18 === 0) {
+      addParticles(player.x + 15, player.y - 35, '#00e5ff', 2, 2.5);
+    }
+  }
+
+  if (player.bubbleTimer > 0) {
+    player.bubbleTimer--;
+    if (player.bubbleTimer % 16 === 0) {
+      addParticles(player.x + 15, player.y - 25, '#f8bbd0', 2, 2);
+    }
+  }
+
+  if (player.poisonTimer > 0) {
+    player.poisonTimer--;
+    if (player.poisonTimer % 35 === 0) {
+      player.hp = Math.max(1, player.hp - 2);
+      addParticles(player.x + 15, player.y - 35, '#b829ff', 4, 2);
+    }
+  }
+
+  if (player.invulnTimer > 0) player.invulnTimer--;
+
+  const isBubbled = player.bubbleTimer > 0;
+
+  if (player.paralysisTimer > 0) {
+    player.paralysisTimer--;
+    player.vx *= 0.7;
+    player.attackHitbox = null;
+    if (player.state !== 'hurt') {
+      player.state = 'idle';
+    }
+    if (player.paralysisTimer % 12 === 0) {
+      addParticles(player.x + 15, player.y - 30, '#ffee00', 3, 3);
+    }
+  } else if (player.state === 'idle' || player.state === 'run' || player.state === 'jump') {
+    let move = 0;
+    if (keys['KeyA'] || keys['ArrowLeft']) move -= 1;
+    if (keys['KeyD'] || keys['ArrowRight']) move += 1;
+
+    const maxSpeed = isGS ? 4.1 : (isDB ? (player.demonMode ? 6.2 : 5.2) : 4.5);
+    if (move !== 0) {
+      player.facing = move;
+      if (isBubbled) {
+        player.vx += move * 0.42;
+        const maxSlipSpeed = maxSpeed * 1.28;
+        player.vx = Math.max(-maxSlipSpeed, Math.min(maxSlipSpeed, player.vx));
+      } else {
+        player.vx = move * maxSpeed;
+      }
+      if (player.y >= GROUND_Y) player.state = 'run';
+    } else {
+      player.vx *= isBubbled ? 0.955 : 0.7;
+      if (Math.abs(player.vx) < 0.08) player.vx = 0;
+      if (player.y >= GROUND_Y) player.state = 'idle';
+    }
+
+    if ((keys['KeyW'] || keys['Space'] || keys['ArrowUp']) && player.y >= GROUND_Y) {
+      player.vy = -12.5;
+      player.state = 'jump';
+    }
+  } else if (player.state === 'dbSlash') {
+    player.vx *= 0.84;
+    player.stateTimer--;
+    if (player.stateTimer >= 4 && player.stateTimer <= 13) {
+      player.attackHitbox = {
+        x: player.facing === 1 ? player.x + 16 : player.x - 76,
+        y: player.y - 68,
+        w: 76,
+        h: 68
+      };
+    } else {
+      player.attackHitbox = null;
+    }
+    if (player.stateTimer <= 0) {
+      player.state = 'idle';
+      player.attackHitbox = null;
+    }
+  } else if (player.state === 'dbSpinDash') {
+    player.vx *= 0.9;
+    player.stateTimer--;
+    if (player.stateTimer >= 4 && player.stateTimer <= 17) {
+      player.attackHitbox = {
+        x: player.facing === 1 ? player.x + 8 : player.x - 66,
+        y: player.y - 66,
+        w: 88,
+        h: 66
+      };
+    } else {
+      player.attackHitbox = null;
+    }
+    if (player.stateTimer <= 0) {
+      player.state = 'idle';
+      player.attackHitbox = null;
+    }
+  } else if (player.state === 'attack') {
+    player.vx *= isBubbled ? 0.94 : 0.8;
+    player.stateTimer--;
+    if (isGS) {
+      if (player.stateTimer >= 8 && player.stateTimer <= 17) {
+        player.attackHitbox = {
+          x: player.facing === 1 ? player.x + 18 : player.x - 110,
+          y: player.y - 88,
+          w: 110,
+          h: 88
+        };
+      } else {
+        player.attackHitbox = null;
+      }
+    } else {
+      if (player.stateTimer >= 6 && player.stateTimer <= 13) {
+        player.attackHitbox = {
+          x: player.facing === 1 ? player.x + 20 : player.x - 95,
+          y: player.y - 75,
+          w: 95,
+          h: 75
+        };
+      } else {
+        player.attackHitbox = null;
+      }
+    }
+    if (player.stateTimer <= 0) {
+      player.state = 'idle';
+      player.attackHitbox = null;
+    }
+  } else if (player.state === 'gsCharge') {
+    player.vx *= isBubbled ? 0.93 : 0.7;
+    player.chargeFrames++;
+    const maxChargeF = getMaxChargeFrames();
+    const lv1F = Math.round(maxChargeF * 0.29);
+    const lv2F = Math.round(maxChargeF * 0.63);
+    const lv3F = maxChargeF;
+
+    if (player.chargeFrames === lv1F) {
+      player.chargeLevel = 1;
+      addParticles(player.x + 15, player.y - 45, '#ffffff', 10, 4);
+    } else if (player.chargeFrames === lv2F) {
+      player.chargeLevel = 2;
+      addParticles(player.x + 15, player.y - 45, '#ffd700', 14, 5);
+    } else if (player.chargeFrames === lv3F) {
+      player.chargeLevel = 3;
+      addText('最大溜め！', player.x - 10, player.y - 82, '#ff5252', 18);
+      addParticles(player.x + 15, player.y - 45, '#ff3333', 18, 6);
+    }
+
+    const isHoldingCharge = keys['KeyK'] || keys['KeyX'];
+    if (!isHoldingCharge || player.chargeFrames >= lv3F + 28) {
+      player.state = 'gsChargeSlash';
+      player.stateTimer = 24;
+      resetMonsterSwingHitFlags();
+      player.vx = player.facing * (3 + player.chargeLevel * 1.2);
+    }
+  } else if (player.state === 'gsChargeSlash') {
+    player.vx *= isBubbled ? 0.92 : 0.82;
+    player.stateTimer--;
+    if (player.stateTimer >= 9 && player.stateTimer <= 19) {
+      player.attackHitbox = {
+        x: player.facing === 1 ? player.x + 15 : player.x - 125,
+        y: player.y - 95,
+        w: 125,
+        h: 95
+      };
+    } else {
+      player.attackHitbox = null;
+    }
+    if (player.stateTimer <= 0) {
+      player.state = 'idle';
+      player.attackHitbox = null;
+      player.chargeLevel = 0;
+    }
+  } else if (player.state === 'gsTackle') {
+    player.vx *= 0.88;
+    player.stateTimer--;
+    if (player.stateTimer >= 6 && player.stateTimer <= 16) {
+      player.attackHitbox = {
+        x: player.facing === 1 ? player.x + 10 : player.x - 35,
+        y: player.y - 60,
+        w: 55,
+        h: 60
+      };
+    } else {
+      player.attackHitbox = null;
+    }
+    if (player.stateTimer <= 0) {
+      player.state = 'idle';
+      player.attackHitbox = null;
+    }
+  } else if (player.state === 'spiritAttack') {
+    player.vx = player.facing * 2.5;
+    player.stateTimer--;
+    if (player.stateTimer >= 6 && player.stateTimer <= 16) {
+      player.attackHitbox = {
+        x: player.facing === 1 ? player.x + 15 : player.x - 115,
+        y: player.y - 80,
+        w: 115,
+        h: 80
+      };
+    } else {
+      player.attackHitbox = null;
+    }
+    if (player.stateTimer <= 0) {
+      player.state = 'idle';
+      player.attackHitbox = null;
+    }
+  } else if (player.state === 'foresight') {
+    player.stateTimer--;
+    if (player.stateTimer === 12) {
+      player.vx = player.facing * 10;
+    } else {
+      player.vx *= 0.85;
+    }
+    if (player.stateTimer >= 4 && player.stateTimer <= 12) {
+      player.attackHitbox = {
+        x: player.facing === 1 ? player.x + 15 : player.x - 105,
+        y: player.y - 80,
+        w: 105,
+        h: 80
+      };
+    } else {
+      player.attackHitbox = null;
+    }
+    if (player.stateTimer <= 0) {
+      player.state = 'idle';
+      player.attackHitbox = null;
+    }
+  } else if (player.state === 'dodge' || player.state === 'hurt') {
+    player.vx *= isBubbled ? 0.94 : 0.9;
+    player.stateTimer--;
+    if (player.stateTimer <= 0) player.state = 'idle';
+  }
+
+  player.vy += GRAVITY;
+  player.x += player.vx;
+  player.y += player.vy;
+
+  if (player.y >= GROUND_Y) {
+    player.y = GROUND_Y;
+    player.vy = 0;
+  }
+  player.x = Math.max(20, Math.min(canvas.width - 50, player.x));
+
+  if (player.attackHitbox) {
+    const weapon = getCurrentWeapon();
+    const isThunderWeapon = weapon.element === 'thunder';
+    const isFireWeapon = weapon.element === 'fire';
+    const isWaterWeapon = weapon.element === 'water';
+    const isIceWeapon = weapon.element === 'ice';
+    const isDragonWeapon = weapon.element === 'dragon';
+
+    const hitSparkColor = isThunderWeapon ? '#00e5ff'
+      : (isFireWeapon ? '#ff6d00'
+        : (isWaterWeapon ? '#4fc3f7'
+          : (isIceWeapon ? '#80deea'
+            : (isDragonWeapon ? '#d500f9' : '#fff'))));
+
+    for (const m of activeMonsters) {
+      if (m.hp <= 0 || m.hasHitThisSwingByPlayer) continue;
+      if (!rectIntersect(player.attackHitbox, getMonsterBody(m))) continue;
+
+      m.hasHitThisSwingByPlayer = true;
+      m.flashTimer = 6;
+
+      let result = { dmg: 0, elemMult: 1.0 };
+      let hitCount = 1;
+      let hitDamages = [];
+
+      if (isDB) {
+        // 双剣：1回の攻撃でランダム2〜3回ダメージを与える！
+        hitCount = Math.random() < 0.5 ? 2 : 3;
+        const demonMult = player.demonMode ? 1.2 : 1.0;
+        const perHitMV = player.state === 'dbSpinDash' ? 14 : 11;
+        for (let h = 0; h < hitCount; h++) {
+          const rHit = computeWeaponHitDamage(perHitMV, weapon, demonMult, m.species);
+          hitDamages.push(rHit.dmg);
+          result.elemMult = rHit.elemMult;
+        }
+        result.dmg = hitDamages.reduce((a, b) => a + b, 0);
+        screenShake = Math.max(screenShake, player.state === 'dbSpinDash' ? 5 : 3);
+        addParticles(m.x + 40, m.y - 45, hitSparkColor, 10 + hitCount * 4, 6);
+      } else if (isGS) {
+        if (player.state === 'attack') {
+          result = computeWeaponHitDamage(31, weapon, 1.0, m.species);
+          addParticles(m.x + 40, m.y - 45, hitSparkColor, 12, 6);
+        } else if (player.state === 'gsChargeSlash') {
+          const chargeBase = [34, 50, 68, 92][player.chargeLevel];
+          result = computeWeaponHitDamage(chargeBase, weapon, 1.0, m.species);
+          screenShake = 5 + player.chargeLevel * 3;
+          addParticles(m.x + 40, m.y - 45, hitSparkColor === '#fff' ? '#ffd700' : hitSparkColor, 14 + player.chargeLevel * 5, 8);
+        } else if (player.state === 'gsTackle') {
+          const baseAtk = getCurrentWeapon().attack + getAttackSkillBonus();
+          result = { dmg: Math.round(18 * (baseAtk / 80)), elemMult: 1.0 };
+          screenShake = 4;
+          addParticles(m.x + 40, m.y - 45, '#ffffff', 10, 5);
+        }
+        hitDamages = [result.dmg];
+      } else {
+        const auraMult = [1.0, 1.1, 1.2, 1.35][player.spiritLevel];
+
+        if (player.state === 'attack') {
+          result = computeWeaponHitDamage(28, weapon, auraMult, m.species);
+          if (!player.hasHitThisSwing) {
+            player.spirit = Math.min(player.maxSpirit, player.spirit + 22);
+          }
+          addParticles(m.x + 40, m.y - 45, hitSparkColor, weapon.element !== 'none' ? 12 : 8, 5);
+        } else if (player.state === 'spiritAttack') {
+          result = computeWeaponHitDamage(52, weapon, auraMult, m.species);
+          if (!player.hasHitThisSwing) {
+            if (player.spiritLevel < 3) {
+              player.spiritLevel++;
+              player.spiritTimer = 1200;
+              const names = ['', '練気【白】', '練気【黄】', '練気【赤】'];
+              const colors = ['', '#ffffff', '#ffd700', '#ff3333'];
+              addText(names[player.spiritLevel], player.x, player.y - 85, colors[player.spiritLevel], 20);
+            } else {
+              player.spiritTimer = 1200;
+            }
+          }
+          screenShake = 5;
+          addParticles(m.x + 40, m.y - 45, weapon.element !== 'none' ? hitSparkColor : '#ff4444', 16, 7);
+        } else if (player.state === 'foresight') {
+          result = computeWeaponHitDamage(player.foresightSuccess ? 65 : 25, weapon, auraMult, m.species);
+          if (player.foresightSuccess && !player.hasHitThisSwing) {
+            player.spirit = 100;
+            if (player.spiritLevel < 3) player.spiritLevel++;
+            player.spiritTimer = 1200;
+            addText('見切り成功！練気解放！', player.x - 30, player.y - 90, '#00ffff', 22);
+            screenShake = 8;
+          }
+          addParticles(m.x + 40, m.y - 45, '#00ffff', 16, 7);
+        }
+        hitDamages = [result.dmg];
+      }
+
+      player.hasHitThisSwing = true;
+
+      const dmg = result.dmg;
+      m.hp -= dmg;
+
+      let dmgTextColor = isThunderWeapon ? '#80ffff'
+        : (isFireWeapon ? '#ffab40'
+          : (isWaterWeapon ? '#4fc3f7'
+            : (isIceWeapon ? '#b2ebf2'
+              : (isDragonWeapon ? '#ea80fc' : '#ffd700'))));
+      if (weapon.element !== 'none' && !(isGS && player.state === 'gsTackle')) {
+        if (result.elemMult === 0) {
+          dmgTextColor = '#b0bec5';
+        } else if (result.elemMult >= 1.25) {
+          dmgTextColor = isDragonWeapon ? '#e040fb'
+            : (isFireWeapon ? '#ff6d00'
+              : (isWaterWeapon ? '#29b6f6'
+                : (isIceWeapon ? '#4dd0e1' : '#00e5ff')));
+        }
+      }
+
+      // ダメージ数値表示（双剣は2〜3回分を連撃表示！）
+      if (isDB) {
+        hitDamages.forEach((hd, idx) => {
+          addText(hd, m.x + 28 + idx * 18, m.y - 54 - idx * 18, dmgTextColor, 20);
+        });
+        addText(`${hitCount}HIT!`, m.x + 36, m.y - 108, '#ffee58', 15);
+      } else {
+        addText(dmg, m.x + 40 + (Math.random() * 20 - 10), m.y - 60, dmgTextColor, isGS && player.state === 'gsChargeSlash' && player.chargeLevel >= 2 ? 26 : 22);
+      }
+
+
+      if (m.hp <= 0) {
+        m.hp = 0;
+        m.attackHitbox = null;
+        addText('部位破壊・討伐！', m.x + 10, m.y - 95, '#ffd700', 22);
+        addParticles(m.x + m.w / 2, m.y - 45, '#ffd700', 24, 7);
+        continue;
+      }
+
+      if (m.species === 'gore' && m.isFrenzied) {
+        m.frenzyDamageTaken += dmg;
+        const threshold = Math.ceil(m.maxHp / 16);
+        if (m.frenzyDamageTaken >= threshold) {
+          m.isFrenzied = false;
+          m.frenzyDamageTaken = 0;
+          m.frenzyCooldown = 900;
+          m.state = 'stagger';
+          m.stateTimer = 70;
+          m.attackHitbox = null;
+          screenShake = 12;
+          addText('狂竜化解除！！（15秒間抑制）', m.x - 30, m.y - 115, '#e040fb', 23);
+          addParticles(m.x + m.w / 2, m.y - 50, '#ea80fc', 28, 8);
+          continue;
+        }
+      }
+
+      const staggerChance = isGS ? (player.state === 'gsChargeSlash' ? 0.16 + player.chargeLevel * 0.05 : 0.18) : (isDB ? 0.09 : 0.12);
+      if (Math.random() < staggerChance && m.state !== 'stagger') {
+        m.state = 'stagger';
+        m.stateTimer = 50;
+        m.isFlying = false;
+        m.isCharged = false;
+        m.somersaultAngle = 0;
+        m.attackHitbox = null;
+        m.isPoisonAttack = false;
+        m.isElectricAttack = false;
+        m.isBubbleAttack = false;
+        addText('怯み！', m.x + 30, m.y - 100, '#ffaa00', 24);
+      }
+    }
+  }
+}
+
+function getMonsterBody(m) {
+  return { x: m.x, y: m.y - m.h, w: m.w, h: m.h };
+}
+
+function updateSingleMonster(m) {
+  // 一対の巨影：リオレイアのHPが2000以下になったらリオレウス登場！（全武器種共通）
+  if (targetMonster === 'raths_duo' && m.species === 'rathian' && !duoRathalosSpawned && m.hp <= 2000) {
+    duoRathalosSpawned = true;
+    const rath = createMonsterEntity('rathalos', player.x < 450 ? 740 : 120);
+    rath.isFlying = true;
+    rath.y = GROUND_Y - 125;
+    rath.state = 'roar';
+    rath.stateTimer = 45;
+    activeMonsters.push(rath);
+    screenShake = 12;
+    addText('火竜 リオレウス 乱入！！', canvas.width / 2 - 120, 145, '#ff5252', 26);
+    addParticles(rath.x + rath.w / 2, rath.y - 50, '#ff6d00', 26, 8);
+  }
+  if (m.hp <= 0) return;
+  if (m.hp <= 0) return;
+  if (m.flashTimer > 0) m.flashTimer--;
+
+  // 外部箱のカスタムAI更新フック
+  if (typeof EXTRA_HOOKS.onUpdateMonster === 'function') {
+    const handled = EXTRA_HOOKS.onUpdateMonster(m, getHookContext());
+    if (handled) return;
+  }
+
+  const sp = m.species;
+
+  if (sp === 'zinogre' || sp === 'kirin' || sp === 'gore' || sp === 'tobi' || sp === 'mizutsune') {
+    m.isFlying = false;
+  }
+
+  if (m.state !== 'poisonTail') {
+    const desiredY = m.isFlying ? GROUND_Y - 125 : GROUND_Y;
+    m.y += (desiredY - m.y) * 0.09;
+    m.somersaultAngle = 0;
+  }
+
+  if (sp === 'zinogre' && m.isCharged && Math.random() < 0.35) {
+    addParticles(m.x + Math.random() * m.w, m.y - Math.random() * m.h, '#00e5ff', 1, 2);
+  }
+  if (sp === 'tobi' && Math.random() < 0.32) {
+    addParticles(m.x + Math.random() * m.w, m.y - Math.random() * m.h, '#ffee58', 1, 2);
+  }
+  if (sp === 'kirin' && Math.random() < 0.3) {
+    addParticles(m.x + Math.random() * m.w, m.y - Math.random() * m.h, '#b3e5fc', 1, 2);
+  }
+  if (sp === 'barioth' && Math.random() < 0.25) {
+    addParticles(m.x + Math.random() * m.w, m.y - Math.random() * m.h, '#b2ebf2', 1, 2);
+  }
+  if (sp === 'mizutsune' && Math.random() < 0.25) {
+    addParticles(m.x + Math.random() * m.w, m.y - Math.random() * m.h, '#f8bbd0', 1, 2);
+  }
+  if (sp === 'gore') {
+    if (m.frenzyCooldown > 0) {
+      m.frenzyCooldown--;
+    }
+    if (m.isFrenzied) {
+      if (Math.random() < 0.45) {
+        addParticles(m.x + Math.random() * m.w, m.y - Math.random() * m.h, '#aa00ff', 1, 3);
+      }
+    } else if (Math.random() < 0.18) {
+      addParticles(m.x + Math.random() * m.w, m.y - Math.random() * m.h, '#6a1b9a', 1, 2);
+    }
+  }
+
+  m.stateTimer--;
+
+  if (m.state === 'idle') {
+    m.facing = player.x < m.x + m.w / 2 ? -1 : 1;
+    m.vx *= 0.8;
+    if (m.stateTimer <= 0) {
+      chooseMonsterAction(m);
+    }
+  } else if (m.state === 'walk') {
+    m.facing = player.x < m.x + m.w / 2 ? -1 : 1;
+    m.vx = m.facing * (sp === 'zinogre' || sp === 'tobi' ? 3.2 : 2.2);
+    if (m.stateTimer <= 0) {
+      chooseMonsterAction(m);
+    }
+  } else if (m.state === 'roar') {
+    m.vx = 0;
+    if (m.stateTimer === 35) {
+      screenShake = 10;
+      addText('グオオォォォ！！', m.x, m.y - 110, '#ff5555', 22);
+      addParticles(m.x + 50, m.y - 60, '#ffaa00', 20, 8);
+    }
+    if (m.stateTimer <= 0) {
+      if (sp === 'rathalos') {
+        m.isFlying = true;
+      }
+      m.state = 'idle';
+      m.stateTimer = 30;
+    }
+  } else if (m.state === 'tobiScratch') {
+    if (m.stateTimer > 20) {
+      m.vx = -m.facing * 1.3;
+      m.attackHitbox = null;
+      if (m.stateTimer % 3 === 0) {
+        const clawX = m.facing === 1 ? m.x + m.w : m.x;
+        addParticles(clawX, m.y - 45, '#ffee58', 3, 3);
+      }
+    } else if (m.stateTimer > 7) {
+      m.vx = m.facing * 9.8;
+      const hitX = m.facing === 1 ? m.x + 22 : m.x - 42;
+      m.attackHitbox = {
+        x: hitX,
+        y: m.y - m.h,
+        w: m.w + 20,
+        h: m.h
+      };
+      m.isPoisonAttack = false;
+      m.isElectricAttack = true;
+      m.isBubbleAttack = false;
+      addParticles(hitX + (m.facing === 1 ? m.w : 0), m.y - 35, '#ffee58', 3, 4);
+    } else {
+      m.vx *= 0.7;
+      m.attackHitbox = null;
+      m.isElectricAttack = false;
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 38;
+      m.attackHitbox = null;
+      m.isElectricAttack = false;
+    }
+  } else if (m.state === 'tobiCharge') {
+    if (m.stateTimer > 24) {
+      m.vx = -m.facing * 1.6;
+      if (m.stateTimer % 3 === 0) {
+        addParticles(m.x + m.w / 2, m.y - 45, '#fff176', 3, 3);
+      }
+    } else {
+      m.vx = m.facing * 12.2;
+      m.attackHitbox = getMonsterBody(m);
+      m.isPoisonAttack = false;
+      m.isElectricAttack = true;
+      m.isBubbleAttack = false;
+      if (m.stateTimer % 2 === 0) {
+        addParticles(m.x + m.w / 2, m.y - 35, '#ffee58', 2, 4);
+      }
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 42;
+      m.attackHitbox = null;
+      m.isElectricAttack = false;
+    }
+  } else if (m.state === 'tobiWave') {
+    m.vx = 0;
+    if (m.stateTimer === 24) {
+      spawnThunderWave(m);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 40;
+    }
+  } else if (m.state === 'mizuSlide') {
+    if (m.stateTimer > 28) {
+      m.vx = -m.facing * 4.5;
+      if (m.stateTimer % 3 === 0) {
+        addParticles(m.x + m.w / 2, GROUND_Y - 12, '#f8bbd0', 3, 3);
+      }
+    } else if (m.stateTimer > 8) {
+      m.vx = m.facing * 11.5;
+      m.attackHitbox = getMonsterBody(m);
+      m.isPoisonAttack = false;
+      m.isElectricAttack = false;
+      m.isBubbleAttack = true;
+      if (m.stateTimer % 2 === 0) {
+        addParticles(m.x + m.w / 2, GROUND_Y - 16, '#81d4fa', 2, 3);
+      }
+    } else {
+      m.vx *= 0.82;
+      m.attackHitbox = null;
+      m.isBubbleAttack = false;
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 38;
+      m.attackHitbox = null;
+      m.isBubbleAttack = false;
+    }
+  } else if (m.state === 'mizuWaterBeam') {
+    m.vx = 0;
+    if (m.stateTimer === 24) {
+      spawnWaterJet(m);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 40;
+    }
+  } else if (m.state === 'mizuBubbles') {
+    m.vx = 0;
+    if (m.stateTimer === 24) {
+      spawnBubbleOrbs(m);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 40;
+    }
+  } else if (m.state === 'bariothAerialBeam') {
+    m.isFlying = true;
+    m.facing = player.x < m.x + m.w / 2 ? -1 : 1;
+    m.vx *= 0.85;
+
+    if (m.stateTimer === 48) {
+      spawnBariothIceBeam(m);
+      m.bariothBeamsFired = 1;
+    }
+    if (m.bariothBeamCount === 2 && m.stateTimer === 22) {
+      spawnBariothIceBeam(m);
+      m.bariothBeamsFired = 2;
+    }
+
+    if (m.stateTimer <= 0) {
+      m.isFlying = false;
+      m.state = 'idle';
+      m.stateTimer = 42;
+    }
+  } else if (m.state === 'bariothIceSpear') {
+    m.vx = 0;
+    if (m.stateTimer === 38) {
+      spawnBariothIceSpear(m);
+      addParticles(m.x + m.w / 2, m.y - 50, '#80deea', 16, 5);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 46;
+    }
+  } else if (m.state === 'goreFrenzyRoar') {
+    m.vx = 0;
+    if (m.stateTimer % 3 === 0) {
+      addParticles(m.x + m.w / 2, m.y - 55, '#aa00ff', 7, 6);
+    }
+    if (m.stateTimer === 14) {
+      m.isFrenzied = true;
+      m.frenzyDamageTaken = 0;
+      screenShake = 12;
+      addText('狂竜化！！', m.x + 10, m.y - 115, '#d500f9', 24);
+      addParticles(m.x + m.w / 2, m.y - 50, '#e040fb', 30, 9);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 25;
+    }
+  } else if (m.state === 'goreExplodeBreath') {
+    m.vx = 0;
+    const triggerFrame = m.isFrenzied ? 22 : 28;
+    if (m.stateTimer === triggerFrame) {
+      const targetX = player.x + player.w / 2;
+      spawnFrenzyBomb(targetX);
+      if (m.isFrenzied) {
+        spawnFrenzyBomb(targetX + m.facing * 95);
+      }
+      const mouthX = m.facing === 1 ? m.x + m.w : m.x;
+      addParticles(mouthX, m.y - 55, '#aa00ff', 15, 5);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = m.isFrenzied ? 30 : 42;
+    }
+  } else if (m.state === 'goreSpreadBreath') {
+    m.vx = 0;
+    const triggerFrame = m.isFrenzied ? 22 : 28;
+    if (m.stateTimer === triggerFrame) {
+      const targetX = player.x + player.w / 2;
+      spawnFrenzySpreadCloud(targetX, m.isFrenzied);
+      const mouthX = m.facing === 1 ? m.x + m.w : m.x;
+      addParticles(mouthX, m.y - 52, '#d500f9', 18, 6);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = m.isFrenzied ? 32 : 44;
+    }
+  } else if (m.state === 'goreSlam') {
+    const windupEnd = m.isFrenzied ? 22 : 28;
+    const slamEnd = 10;
+    if (m.stateTimer > windupEnd) {
+      m.vx = -m.facing * 1.4;
+      m.attackHitbox = null;
+      if (m.stateTimer % 4 === 0) {
+        const wingX = m.facing === 1 ? m.x + m.w : m.x;
+        addParticles(wingX, m.y - 80, '#aa00ff', 3, 3);
+      }
+    } else if (m.stateTimer > slamEnd) {
+      m.vx = m.facing * (m.isFrenzied ? 10.5 : 8.5);
+      const slamX = m.facing === 1 ? m.x + 25 : m.x - 45;
+      m.attackHitbox = {
+        x: slamX,
+        y: m.y - m.h,
+        w: m.w + 20,
+        h: m.h
+      };
+      m.isPoisonAttack = false;
+      m.isElectricAttack = false;
+      m.isBubbleAttack = false;
+      if (m.stateTimer === windupEnd - 2) {
+        screenShake = 8;
+        addParticles(slamX + (m.facing === 1 ? m.w : 0), GROUND_Y - 12, '#aa00ff', 16, 6);
+      }
+    } else {
+      m.vx *= 0.7;
+      m.attackHitbox = null;
+    }
+
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = m.isFrenzied ? 32 : 45;
+      m.attackHitbox = null;
+    }
+  } else if (m.state === 'charge') {
+    if (m.stateTimer > 25) {
+      m.vx = -m.facing * 1.5;
+    } else {
+      const chargeSpeed = (sp === 'kirin' || sp === 'barioth') ? 12.5 : 11;
+      m.vx = m.facing * chargeSpeed;
+      m.attackHitbox = getMonsterBody(m);
+      m.isPoisonAttack = false;
+      m.isElectricAttack = false;
+      m.isBubbleAttack = false;
+      if (sp === 'barioth' && m.stateTimer % 3 === 0) {
+        addParticles(m.x + m.w / 2, GROUND_Y - 12, '#b2ebf2', 2, 3);
+      }
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 45;
+      m.attackHitbox = null;
+    }
+  } else if (m.state === 'kirinAroundThunder') {
+    m.vx = 0;
+    if (m.stateTimer === 32) {
+      const cx = m.x + m.w / 2;
+      const offsets = [-170, -85, 85, 170];
+      offsets.forEach(off => spawnLightningCloud(cx + off));
+      addParticles(cx, m.y - m.h - 10, '#81d4fa', 16, 5);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 45;
+    }
+  } else if (m.state === 'kirinTargetThunder') {
+    m.vx = 0;
+    if (m.stateTimer === 32) {
+      const targetX = player.x + player.w / 2;
+      spawnLightningCloud(targetX);
+      const cx = m.x + m.w / 2;
+      addParticles(cx, m.y - m.h - 10, '#4fc3f7', 16, 5);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 45;
+    }
+  } else if (m.state === 'kirinGrandThunder') {
+    m.vx = 0;
+    if (m.stateTimer % 4 === 0) {
+      addParticles(m.x + m.w / 2, m.y - m.h - 16, '#00e5ff', 5, 5);
+    }
+    if (m.stateTimer === 32) {
+      const startOffset = 75 + Math.random() * 45;
+      for (let k = 0; k < 6; k++) {
+        spawnLightningCloud(startOffset + k * 145);
+      }
+      screenShake = 9;
+      addText('大放電！！', m.x + 10, m.y - 115, '#80d8ff', 22);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 46;
+    }
+  } else if (m.state === 'fireball') {
+    m.vx = 0;
+    if (m.stateTimer === 25) {
+      const mouthX = m.facing === 1 ? m.x + m.w : m.x;
+      const mouthY = m.y - 65;
+      const angle = Math.atan2((player.y - 30) - mouthY, (player.x + 15) - mouthX);
+      fireballs.push({
+        x: mouthX, y: mouthY,
+        vx: Math.cos(angle) * 7.5,
+        vy: Math.sin(angle) * 7.5,
+        r: 14
+      });
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 40;
+    }
+  } else if (m.state === 'poisonShot') {
+    m.vx = 0;
+    if (m.stateTimer === 25) {
+      const mouthX = m.facing === 1 ? m.x + m.w : m.x;
+      const mouthY = m.y - 65;
+      const angle = Math.atan2((player.y - 30) - mouthY, (player.x + 15) - mouthX);
+      poisonClouds.push({
+        x: mouthX, y: mouthY,
+        vx: Math.cos(angle) * 6.8,
+        vy: Math.sin(angle) * 6.8,
+        r: 15
+      });
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 40;
+    }
+  } else if (m.state === 'poisonTail') {
+    if (m.stateTimer > 38) {
+      m.vx = -m.facing * 1.8;
+      m.somersaultAngle = 0;
+      m.attackHitbox = null;
+      if (m.stateTimer % 4 === 0) {
+        const tailTipX = m.facing === 1 ? m.x - 30 : m.x + m.w + 30;
+        addParticles(tailTipX, m.y - 40, '#b829ff', 3, 2);
+      }
+    } else if (m.stateTimer > 12) {
+      const progress = (38 - m.stateTimer) / 26;
+      m.vx = m.facing * 5.2;
+      m.y = GROUND_Y - Math.sin(progress * Math.PI) * 115;
+      m.somersaultAngle = -m.facing * progress * Math.PI * 2;
+
+      const centerX = m.x + m.w / 2;
+      const centerY = m.y - m.h / 2;
+      const tailDist = 115;
+      const tailAngle = m.somersaultAngle + (m.facing === 1 ? Math.PI : 0);
+      const tailRootX = centerX + Math.cos(tailAngle) * 35;
+      const tailRootY = centerY + Math.sin(tailAngle) * 35;
+      const tailTipX = centerX + Math.cos(tailAngle) * tailDist;
+      const tailTipY = centerY + Math.sin(tailAngle) * tailDist;
+
+      addParticles(tailTipX, tailTipY, '#c94bff', 3, 2);
+
+      const minX = Math.min(tailRootX, tailTipX) - 26;
+      const maxX = Math.max(tailRootX, tailTipX) + 26;
+      const minY = Math.min(tailRootY, tailTipY) - 26;
+      const maxY = Math.max(tailRootY, tailTipY) + 26;
+
+      m.attackHitbox = {
+        x: minX,
+        y: minY,
+        w: maxX - minX,
+        h: maxY - minY
+      };
+      m.isPoisonAttack = true;
+      m.isElectricAttack = false;
+      m.isBubbleAttack = false;
+    } else {
+      m.vx *= 0.7;
+      m.y = GROUND_Y;
+      m.somersaultAngle = 0;
+      m.attackHitbox = null;
+      m.isPoisonAttack = false;
+    }
+
+    if (m.stateTimer <= 0) {
+      m.y = GROUND_Y;
+      m.somersaultAngle = 0;
+      m.state = 'idle';
+      m.stateTimer = 45;
+      m.attackHitbox = null;
+      m.isPoisonAttack = false;
+    }
+  } else if (m.state === 'zinogreCharge') {
+    m.vx = 0;
+    if (m.stateTimer % 4 === 0) {
+      addParticles(m.x + m.w / 2, m.y - 50, '#00e5ff', 6, 5);
+    }
+    if (m.stateTimer === 10) {
+      m.isCharged = true;
+      screenShake = 8;
+      addText('超帯電状態！！', m.x, m.y - 110, '#00e5ff', 22);
+      addParticles(m.x + m.w / 2, m.y - 50, '#80ffff', 25, 8);
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 35;
+    }
+  } else if (m.state === 'thunderShot') {
+    m.vx = 0;
+    if (m.stateTimer === 25) {
+      const mouthX = m.facing === 1 ? m.x + m.w : m.x;
+      const mouthY = m.y - 60;
+      const angle = Math.atan2((player.y - 30) - mouthY, (player.x + 15) - mouthX);
+      thunderOrbs.push({
+        x: mouthX, y: mouthY,
+        vx: Math.cos(angle) * 7.5,
+        vy: Math.sin(angle) * 7.5,
+        r: 15
+      });
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 40;
+    }
+  } else if (m.state === 'thunderClaw') {
+    if (m.stateTimer > 22) {
+      m.vx = -m.facing * 1.2;
+      if (m.stateTimer % 3 === 0) {
+        const pawX = m.facing === 1 ? m.x + m.w : m.x;
+        addParticles(pawX, m.y - 45, '#00e5ff', 4, 3);
+      }
+    } else if (m.stateTimer > 8) {
+      m.vx = m.facing * 9.5;
+      const clawX = m.facing === 1 ? m.x + 20 : m.x - 35;
+      m.attackHitbox = {
+        x: clawX,
+        y: m.y - m.h,
+        w: m.w + 15,
+        h: m.h
+      };
+      m.isPoisonAttack = false;
+      m.isElectricAttack = true;
+      m.isBubbleAttack = false;
+      addParticles(clawX + (m.facing === 1 ? m.w : 0), m.y - 20, '#00e5ff', 3, 4);
+    } else {
+      m.vx *= 0.7;
+      m.attackHitbox = null;
+      m.isElectricAttack = false;
+    }
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 42;
+      m.attackHitbox = null;
+      m.isElectricAttack = false;
+    }
+  } else if (m.state === 'swoop') {
+    if (m.stateTimer > 30) {
+      m.vx = 0;
+    } else {
+      m.vx = m.facing * 12;
+      m.y = Math.min(GROUND_Y, m.y + 7);
+      m.attackHitbox = getMonsterBody(m);
+      m.isPoisonAttack = false;
+      m.isElectricAttack = false;
+      m.isBubbleAttack = false;
+    }
+    if (m.stateTimer <= 0) {
+      m.isFlying = false;
+      m.state = 'idle';
+      m.stateTimer = 50;
+      m.attackHitbox = null;
+    }
+  } else if (m.state === 'stagger') {
+    m.vx *= 0.8;
+    if (m.stateTimer <= 0) {
+      m.state = 'idle';
+      m.stateTimer = 30;
+    }
+  }
+
+  m.x += m.vx;
+  m.x = Math.max(30, Math.min(canvas.width - m.w - 30, m.x));
+
+  if (m.attackHitbox && !m.hasHitThisAttack) {
+    const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+    if (rectIntersect(m.attackHitbox, pBox)) {
+      const dmg = (sp === 'gore' && m.isFrenzied) ? 32 : 26;
+      damagePlayer(dmg, false, m.isPoisonAttack, m.isElectricAttack, m.isBubbleAttack);
+      m.hasHitThisAttack = true;
+    }
+  }
+}
+
+function chooseMonsterAction(m) {
+  m.facing = player.x < m.x + m.w / 2 ? -1 : 1;
+  m.hasHitThisAttack = false;
+  m.isPoisonAttack = false;
+  m.isElectricAttack = false;
+  m.isBubbleAttack = false;
+
+  // 外部箱の行動決定フック
+  if (typeof EXTRA_HOOKS.onChooseAction === 'function') {
+    const handled = EXTRA_HOOKS.onChooseAction(m, getHookContext());
+    if (handled) return;
+  }
+
+  const r = Math.random();
+  const sp = m.species;
+
+  if (sp === 'tobi') {
+    if (r < 0.36) {
+      m.state = 'tobiScratch';
+      m.stateTimer = 46;
+    } else if (r < 0.70) {
+      m.state = 'tobiCharge';
+      m.stateTimer = 50;
+    } else {
+      m.state = 'tobiWave';
+      m.stateTimer = 44;
+    }
+    return;
+  }
+
+  if (sp === 'mizutsune') {
+    if (r < 0.38) {
+      m.state = 'mizuSlide';
+      m.stateTimer = 52;
+    } else if (r < 0.70) {
+      m.state = 'mizuWaterBeam';
+      m.stateTimer = 44;
+    } else {
+      m.state = 'mizuBubbles';
+      m.stateTimer = 44;
+    }
+    return;
+  }
+
+  if (sp === 'barioth') {
+    if (r < 0.34) {
+      m.state = 'charge';
+      m.stateTimer = 50;
+    } else if (r < 0.67) {
+      m.state = 'bariothAerialBeam';
+      m.bariothBeamCount = Math.random() < 0.5 ? 1 : 2;
+      m.bariothBeamsFired = 0;
+      m.isFlying = true;
+      m.stateTimer = 68;
+    } else {
+      m.state = 'bariothIceSpear';
+      m.stateTimer = 52;
+    }
+    return;
+  }
+
+  if (sp === 'gore') {
+    if (!m.isFrenzied && m.frenzyCooldown <= 0 && r < 0.25) {
+      m.state = 'goreFrenzyRoar';
+      m.stateTimer = 46;
+      return;
+    }
+    const atkRoll = Math.random();
+    if (atkRoll < 0.34) {
+      m.state = 'goreExplodeBreath';
+      m.stateTimer = m.isFrenzied ? 42 : 50;
+    } else if (atkRoll < 0.67) {
+      m.state = 'goreSpreadBreath';
+      m.stateTimer = m.isFrenzied ? 42 : 50;
+    } else {
+      m.state = 'goreSlam';
+      m.stateTimer = m.isFrenzied ? 42 : 50;
+    }
+    return;
+  }
+
+  if (sp === 'kirin') {
+    if (r < 0.28) {
+      m.state = 'charge';
+      m.stateTimer = 50;
+    } else if (r < 0.54) {
+      m.state = 'kirinAroundThunder';
+      m.stateTimer = 46;
+    } else if (r < 0.78) {
+      m.state = 'kirinTargetThunder';
+      m.stateTimer = 46;
+    } else {
+      m.state = 'kirinGrandThunder';
+      m.stateTimer = 50;
+    }
+    return;
+  }
+
+  if (sp === 'zinogre') {
+    if (!m.isCharged && r < 0.25) {
+      m.state = 'zinogreCharge';
+      m.stateTimer = 55;
+    } else if (r < 0.42) {
+      m.state = 'walk';
+      m.stateTimer = 35;
+    } else if (r < 0.62) {
+      m.state = 'charge';
+      m.stateTimer = 52;
+    } else if (r < 0.84) {
+      m.state = 'thunderClaw';
+      m.stateTimer = 48;
+    } else {
+      m.state = 'thunderShot';
+      m.stateTimer = 45;
+    }
+    return;
+  }
+
+  if (sp === 'rathian') {
+    if (r < 0.22) {
+      m.state = 'walk';
+      m.stateTimer = 40;
+    } else if (r < 0.48) {
+      m.state = 'charge';
+      m.stateTimer = 55;
+    } else if (r < 0.72) {
+      m.state = 'poisonTail';
+      m.stateTimer = 64;
+    } else if (r < 0.88) {
+      m.state = 'poisonShot';
+      m.stateTimer = 45;
+    } else {
+      m.state = 'fireball';
+      m.stateTimer = 45;
+    }
+    return;
+  }
+
+  if (m.isFlying) {
+    if (r < 0.55) {
+      m.state = 'fireball';
+      m.stateTimer = 45;
+    } else {
+      m.state = 'swoop';
+      m.stateTimer = 55;
+    }
+  } else {
+    if (r < 0.25) {
+      m.state = 'walk';
+      m.stateTimer = 40;
+    } else if (r < 0.55) {
+      m.state = 'charge';
+      m.stateTimer = 55;
+    } else if (r < 0.82) {
+      m.state = 'fireball';
+      m.stateTimer = 45;
+    } else {
+      m.state = 'roar';
+      m.stateTimer = 50;
+    }
+  }
+}
+
+function updateFireballs() {
+  for (let i = fireballs.length - 1; i >= 0; i--) {
+    const fb = fireballs[i];
+    fb.x += fb.vx;
+    fb.y += fb.vy;
+    addParticles(fb.x, fb.y, '#ff6600', 2, 2);
+
+    const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+    const fbBox = { x: fb.x - fb.r, y: fb.y - fb.r, w: fb.r * 2, h: fb.r * 2 };
+
+    if (rectIntersect(fbBox, pBox)) {
+      damagePlayer(22, true, false, false, false);
+      addParticles(fb.x, fb.y, '#ff3300', 18, 6);
+      fireballs.splice(i, 1);
+      continue;
+    }
+
+    if (fb.y >= GROUND_Y || fb.x < 0 || fb.x > canvas.width) {
+      addParticles(fb.x, fb.y, '#ff5500', 12, 4);
+      fireballs.splice(i, 1);
+    }
+  }
+}
+
+function updatePoisonClouds() {
+  for (let i = poisonClouds.length - 1; i >= 0; i--) {
+    const pc = poisonClouds[i];
+    pc.x += pc.vx;
+    pc.y += pc.vy;
+    addParticles(pc.x, pc.y, '#a020f0', 2, 2);
+
+    const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+    const pcBox = { x: pc.x - pc.r, y: pc.y - pc.r, w: pc.r * 2, h: pc.r * 2 };
+
+    if (rectIntersect(pcBox, pBox)) {
+      damagePlayer(18, false, true, false, false);
+      addParticles(pc.x, pc.y, '#b829ff', 18, 6);
+      poisonClouds.splice(i, 1);
+      continue;
+    }
+
+    if (pc.y >= GROUND_Y || pc.x < 0 || pc.x > canvas.width) {
+      addParticles(pc.x, pc.y, '#9932cc', 12, 4);
+      poisonClouds.splice(i, 1);
+    }
+  }
+}
+
+function updateThunderOrbs() {
+  for (let i = thunderOrbs.length - 1; i >= 0; i--) {
+    const to = thunderOrbs[i];
+    to.x += to.vx;
+    to.y += to.vy;
+    addParticles(to.x, to.y, '#00e5ff', 2, 2);
+
+    const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+    const toBox = { x: to.x - to.r, y: to.y - to.r, w: to.r * 2, h: to.r * 2 };
+
+    if (rectIntersect(toBox, pBox)) {
+      damagePlayer(20, false, false, true, false);
+      addParticles(to.x, to.y, '#00e5ff', 18, 6);
+      thunderOrbs.splice(i, 1);
+      continue;
+    }
+
+    if (to.y >= GROUND_Y || to.x < 0 || to.x > canvas.width) {
+      addParticles(to.x, to.y, '#00b8d4', 12, 4);
+      thunderOrbs.splice(i, 1);
+    }
+  }
+}
+
+function updateThunderWaves() {
+  const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+  for (let i = thunderWaves.length - 1; i >= 0; i--) {
+    const tw = thunderWaves[i];
+    tw.x += tw.vx;
+    if (Math.random() < 0.6) {
+      addParticles(tw.x + tw.w / 2, GROUND_Y - 12, '#ffee58', 1, 2.5);
+    }
+
+    if (!tw.hasHit && rectIntersect(tw, pBox)) {
+      tw.hasHit = true;
+      damagePlayer(22, false, false, true, false);
+      addParticles(tw.x + tw.w / 2, GROUND_Y - 18, '#ffee58', 16, 6);
+    }
+
+    if (tw.x < -60 || tw.x > canvas.width + 60) {
+      thunderWaves.splice(i, 1);
+    }
+  }
+}
+
+function updateMizutsuneAttacks() {
+  const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+
+  for (let i = waterJets.length - 1; i >= 0; i--) {
+    const wj = waterJets[i];
+    wj.x += wj.vx;
+    wj.y += wj.vy;
+    addParticles(wj.x, wj.y, '#4fc3f7', 2, 2);
+
+    const wjBox = { x: wj.x - wj.r, y: wj.y - wj.r, w: wj.r * 2, h: wj.r * 2 };
+    if (rectIntersect(wjBox, pBox)) {
+      damagePlayer(22, false, false, false, true);
+      addParticles(wj.x, wj.y, '#81d4fa', 18, 6);
+      waterJets.splice(i, 1);
+      continue;
+    }
+
+    if (wj.x < -40 || wj.x > canvas.width + 40) {
+      waterJets.splice(i, 1);
+    }
+  }
+
+  for (let i = bubbleOrbs.length - 1; i >= 0; i--) {
+    const bo = bubbleOrbs[i];
+    bo.life--;
+    bo.phase += 0.08;
+    bo.x += bo.vx;
+    bo.vy += 0.14;
+    if (bo.y >= GROUND_Y - bo.r) {
+      bo.y = GROUND_Y - bo.r;
+      bo.vy = -Math.abs(bo.vy) * 0.85;
+    }
+
+    const boBox = { x: bo.x - bo.r, y: bo.y - bo.r, w: bo.r * 2, h: bo.r * 2 };
+    if (rectIntersect(boBox, pBox)) {
+      damagePlayer(15, false, false, false, true);
+      addParticles(bo.x, bo.y, '#f8bbd0', 16, 5);
+      bubbleOrbs.splice(i, 1);
+      continue;
+    }
+
+    if (bo.life <= 0 || bo.x < -40 || bo.x > canvas.width + 40) {
+      bubbleOrbs.splice(i, 1);
+    }
+  }
+}
+
+function updateLightningClouds() {
+  for (let i = lightningClouds.length - 1; i >= 0; i--) {
+    const lc = lightningClouds[i];
+    lc.timer--;
+
+    if (lc.timer % 8 === 0) {
+      addParticles(lc.x + (Math.random() - 0.5) * 44, lc.y + 12, '#80d8ff', 1, 2);
+    }
+
+    if (lc.timer <= 0) {
+      lightningBolts.push({
+        x: lc.x,
+        topY: lc.y + 8,
+        bottomY: GROUND_Y,
+        life: 14
+      });
+      screenShake = Math.max(screenShake, 7);
+      addParticles(lc.x, GROUND_Y - 10, '#e1f5fe', 18, 6);
+
+      const boltBox = { x: lc.x - 22, y: lc.y, w: 44, h: GROUND_Y - lc.y };
+      const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+      if (rectIntersect(boltBox, pBox)) {
+        damagePlayer(24, false, false, true, false);
+      }
+
+      lightningClouds.splice(i, 1);
+    }
+  }
+
+  for (let i = lightningBolts.length - 1; i >= 0; i--) {
+    lightningBolts[i].life--;
+    if (lightningBolts[i].life <= 0) {
+      lightningBolts.splice(i, 1);
+    }
+  }
+}
+
+function updateFrenzyBombs() {
+  for (let i = frenzyOrbs.length - 1; i >= 0; i--) {
+    const orb = frenzyOrbs[i];
+    orb.timer--;
+
+    if (orb.timer % 6 === 0) {
+      addParticles(orb.x + (Math.random() - 0.5) * 24, orb.y, '#aa00ff', 1, 2);
+    }
+
+    if (orb.timer <= 0) {
+      const blastRadius = 56;
+      frenzyExplosions.push({
+        x: orb.x,
+        y: GROUND_Y - 35,
+        r: blastRadius,
+        life: 16
+      });
+      screenShake = Math.max(screenShake, 9);
+      addParticles(orb.x, GROUND_Y - 25, '#d500f9', 24, 7);
+      addParticles(orb.x, GROUND_Y - 25, '#311b92', 14, 5);
+
+      const blastBox = {
+        x: orb.x - blastRadius,
+        y: GROUND_Y - blastRadius * 1.4,
+        w: blastRadius * 2,
+        h: blastRadius * 1.4
+      };
+      const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+      const anyFrenzied = activeMonsters.some(m => m.species === 'gore' && m.isFrenzied);
+      if (rectIntersect(blastBox, pBox)) {
+        damagePlayer(anyFrenzied ? 30 : 24, false, false, false, false);
+      }
+
+      frenzyOrbs.splice(i, 1);
+    }
+  }
+
+  for (let i = frenzyExplosions.length - 1; i >= 0; i--) {
+    frenzyExplosions[i].life--;
+    if (frenzyExplosions[i].life <= 0) {
+      frenzyExplosions.splice(i, 1);
+    }
+  }
+}
+
+function updateFrenzySpreadClouds() {
+  let isStandingInSpread = false;
+  const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+
+  for (let i = frenzySpreadClouds.length - 1; i >= 0; i--) {
+    const cloud = frenzySpreadClouds[i];
+    cloud.timer--;
+
+    if (cloud.timer % 5 === 0) {
+      addParticles(cloud.x + Math.random() * cloud.w, cloud.y + Math.random() * cloud.h, '#9c27b0', 1, 1.5);
+    }
+
+    if (rectIntersect(cloud, pBox)) {
+      isStandingInSpread = true;
+    }
+
+    if (cloud.timer <= 0) {
+      frenzySpreadClouds.splice(i, 1);
+    }
+  }
+
+  if (isStandingInSpread) {
+    player.frenzyCloudTick++;
+    if (player.frenzyCloudTick >= 20) {
+      player.frenzyCloudTick = 0;
+      player.hp = Math.max(0, player.hp - 1);
+      addParticles(player.x + 15, player.y - 20, '#d500f9', 4, 2);
+      addText('-1', player.x + 8, player.y - 62, '#e040fb', 15);
+    }
+  } else {
+    player.frenzyCloudTick = 0;
+  }
+}
+
+function updateBariothAttacks() {
+  const pBox = { x: player.x, y: player.y - player.h, w: player.w, h: player.h };
+
+  for (let i = iceBeams.length - 1; i >= 0; i--) {
+    const beam = iceBeams[i];
+    beam.life--;
+
+    if (!beam.hasHit && beam.life >= 10) {
+      const pCenterX = player.x + player.w / 2;
+      const pCenterY = player.y - player.h / 2;
+      const t = Math.max(0, Math.min(1, ((pCenterX - beam.x1) * (beam.x2 - beam.x1) + (pCenterY - beam.y1) * (beam.y2 - beam.y1)) /
+        (Math.pow(beam.x2 - beam.x1, 2) + Math.pow(beam.y2 - beam.y1, 2))));
+      const closestX = beam.x1 + t * (beam.x2 - beam.x1);
+      const closestY = beam.y1 + t * (beam.y2 - beam.y1);
+      const dist = Math.hypot(pCenterX - closestX, pCenterY - closestY);
+
+      if (dist <= 26) {
+        beam.hasHit = true;
+        damagePlayer(25, false, false, false, false);
+        addParticles(pCenterX, pCenterY, '#80deea', 16, 6);
+      }
+    }
+
+    if (beam.life <= 0) {
+      iceBeams.splice(i, 1);
+    }
+  }
+
+  for (let i = iceSpears.length - 1; i >= 0; i--) {
+    const spear = iceSpears[i];
+
+    if (spear.windupTimer > 0) {
+      spear.windupTimer--;
+      if (spear.windupTimer % 5 === 0) {
+        addParticles(spear.dir === 1 ? spear.x + spear.w : spear.x, spear.y + spear.h / 2, '#b2ebf2', 2, 2);
+      }
+      continue;
+    }
+
+    spear.x += spear.vx;
+    if (Math.random() < 0.5) {
+      addParticles(spear.dir === 1 ? spear.x : spear.x + spear.w, spear.y + spear.h / 2, '#e0f7fa', 1, 2);
+    }
+
+    const spearBox = { x: spear.x, y: spear.y, w: spear.w, h: spear.h };
+    if (!spear.hasHit && rectIntersect(spearBox, pBox)) {
+      spear.hasHit = true;
+      damagePlayer(24, false, false, false, false);
+      addParticles(player.x + player.w / 2, spear.y + spear.h / 2, '#80deea', 18, 6);
+    }
+
+    if (spear.x > canvas.width + 160 || spear.x + spear.w < -160) {
+      iceSpears.splice(i, 1);
+    }
+  }
+}
+
+function damagePlayer(amount, isFire, isPoison, isElectric, isBubble = false) {
+  if (player.state === 'foresight' && player.stateTimer >= 12) {
+    if (!player.foresightSuccess) {
+      player.foresightSuccess = true;
+      addText('キィィン！（見切り）', player.x, player.y - 70, '#00ffff', 18);
+      addParticles(player.x + 15, player.y - 30, '#00ffff', 15, 6);
+    }
+    return;
+  }
+
+  if (player.invulnTimer > 0) return;
+
+  const def = getTotalDefense();
+  const fireRes = getTotalFireRes();
+  const waterRes = getTotalWaterRes();
+  const thunderRes = getTotalThunderRes();
+  const defReduction = Math.round(def / 12);
+  const fireReduction = isFire ? Math.floor(fireRes / 4) * 2 : 0;
+  const waterReduction = isBubble ? Math.floor(waterRes / 4) * 2 : 0;
+  const thunderReduction = isElectric ? Math.floor(thunderRes / 4) * 2 : 0;
+  // 雷属性やられ中の効果：雷属性攻撃の被ダメージ +5
+  const thunderBlightBonus = (isElectric && player.thunderBlightTimer > 0) ? 5 : 0;
+  let finalDamage = Math.max(1, amount - defReduction - fireReduction - waterReduction - thunderReduction + thunderBlightBonus);
+
+  const isTackleArmor = player.state === 'gsTackle';
+  if (isTackleArmor) {
+    finalDamage = Math.max(1, Math.floor(finalDamage * 0.5));
+    player.hp = Math.max(0, player.hp - finalDamage);
+    player.invulnTimer = 30;
+    screenShake = 5;
+    addText(`-${finalDamage} (タックル耐え)`, player.x - 10, player.y - 68, '#ffd54f', 18);
+    addParticles(player.x + 15, player.y - 30, '#ffffff', 12, 5);
+    return;
+  }
+
+  player.hp = Math.max(0, player.hp - finalDamage);
+  player.invulnTimer = 45;
+  player.state = 'hurt';
+  player.stateTimer = 15;
+  player.chargeLevel = 0;
+  player.vx = -player.facing * 6;
+  player.vy = -5;
+  screenShake = 8;
+
+  addText(`-${finalDamage}`, player.x, player.y - 65, '#ff3333', 22);
+  if (isFire) {
+    if (fireRes >= 20) {
+      addText('火やられ無効！', player.x - 10, player.y - 85, '#ffab40', 16);
+    } else {
+      player.burnTimer = 240;
+      addText('火属性やられ！', player.x - 10, player.y - 85, '#ff7700', 16);
+    }
+  }
+  if (isBubble) {
+    const wasBubbled = player.bubbleTimer > 0;
+    if (!wasBubbled) {
+      player.bubbleTimer = 480;
+      addText('泡やられ！（8秒間滑る）', player.x - 20, player.y - 85, '#f48fb1', 16);
+    } else {
+      player.bubbleTimer = Math.max(player.bubbleTimer, 480);
+    }
+
+    const skills = getActiveSkills();
+    if ((skills.bubblyDance || 0) >= 1) {
+      player.bubblyBuffTimer = 1800; // 30秒間攻撃力1.05倍
+      addText('泡沫の舞発動！(30秒間 攻撃1.05倍)', player.x - 36, player.y - 106, '#80deea', 16);
+      addParticles(player.x + 15, player.y - 35, '#80deea', 18, 5);
+    }
+  }
+  if (isPoison) {
+    player.poisonTimer = 300;
+    addText('毒状態！', player.x - 10, player.y - 85, '#d05ce3', 16);
+  }
+  if (isElectric) {
+    if (thunderRes >= 20) {
+      addText('雷やられ無効！', player.x - 10, player.y - 85, '#80d8ff', 16);
+    } else {
+      player.thunderBlightTimer = 240;
+      addText('雷属性やられ！(雷被ダメ+5)', player.x - 24, player.y - 85, '#00e5ff', 16);
+    }
+
+    if (Math.random() < (1 / 8)) {
+      const wasParalyzed = player.paralysisTimer > 0;
+      player.paralysisTimer += 180;
+      addText(wasParalyzed ? '麻痺延長！（+3秒）' : '麻痺状態！（3秒）', player.x - 20, player.y - 105, '#ffee00', 18);
+      addParticles(player.x + 15, player.y - 30, '#ffee00', 20, 6);
+    }
+  }
+}
+
+function rectIntersect(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function draw() {
+  if (gameState === 'questSelect') {
+    drawQuestSelectScreen();
+    if (isEquipMenuOpen) drawEquipMenu();
+    if (isWeaknessGuideOpen) drawWeaknessGuide();
+    return;
+  }
+
+  ctx.save();
+  if (screenShake > 0) {
+    ctx.translate((Math.random() - 0.5) * screenShake, (Math.random() - 0.5) * screenShake);
+    screenShake *= 0.85;
+    if (screenShake < 0.5) screenShake = 0;
+  }
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  ctx.fillStyle = '#3d2e22';
+  ctx.fillRect(0, GROUND_Y, canvas.width, 6);
+
+  drawLightningClouds();
+  drawFrenzyBombs();
+  drawFrenzySpreadClouds();
+
+  activeMonsters.forEach(m => {
+    if (m.hp > 0) {
+      drawSingleMonster(m);
+    }
+  });
+
+  drawThunderWaves();
+  drawMizutsuneAttacks();
+  drawBariothAttacks();
+
+  if (typeof EXTRA_HOOKS.onDrawProjectiles === 'function') {
+    EXTRA_HOOKS.onDrawProjectiles(getHookContext());
+  }
+
+  drawPlayer();
+  drawLightningBolts();
+
+  fireballs.forEach(fb => {
+    ctx.beginPath();
+    ctx.arc(fb.x, fb.y, fb.r, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff4500';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(fb.x, fb.y, fb.r * 0.6, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffee00';
+    ctx.fill();
+  });
+
+  poisonClouds.forEach(pc => {
+    ctx.beginPath();
+    ctx.arc(pc.x, pc.y, pc.r, 0, Math.PI * 2);
+    ctx.fillStyle = '#6a0dad';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(pc.x, pc.y, pc.r * 0.6, 0, Math.PI * 2);
+    ctx.fillStyle = '#da70d6';
+    ctx.fill();
+  });
+
+  thunderOrbs.forEach(to => {
+    ctx.beginPath();
+    ctx.arc(to.x, to.y, to.r, 0, Math.PI * 2);
+    ctx.fillStyle = '#0091ea';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(to.x, to.y, to.r * 0.6, 0, Math.PI * 2);
+    ctx.fillStyle = '#e0f7fa';
+    ctx.fill();
+  });
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.life--;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y, p.size, p.size);
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  for (let i = floatingTexts.length - 1; i >= 0; i--) {
+    const ft = floatingTexts[i];
+    ft.y -= 1.2;
+    ft.life--;
+    ctx.font = `bold ${ft.size}px sans-serif`;
+    ctx.fillStyle = ft.color;
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 3;
+    ctx.strokeText(ft.text, ft.x, ft.y);
+    ctx.fillText(ft.text, ft.x, ft.y);
+    if (ft.life <= 0) floatingTexts.splice(i, 1);
+  }
+
+  ctx.restore();
+
+  drawUI();
+
+  if (isEquipMenuOpen) {
+    drawEquipMenu();
+  }
+
+  if (isWeaknessGuideOpen) {
+    drawWeaknessGuide();
+  }
+}
+
+function drawThunderWaves() {
+  thunderWaves.forEach(tw => {
+    ctx.save();
+    ctx.shadowColor = '#ffee58';
+    ctx.shadowBlur = 14;
+    ctx.fillStyle = 'rgba(255, 238, 88, 0.78)';
+    ctx.beginPath();
+    ctx.moveTo(tw.x, GROUND_Y);
+    ctx.lineTo(tw.x + tw.w * 0.3, tw.y + 8);
+    ctx.lineTo(tw.x + tw.w * 0.55, tw.y);
+    ctx.lineTo(tw.x + tw.w * 0.8, tw.y + 10);
+    ctx.lineTo(tw.x + tw.w, GROUND_Y);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(tw.x + 8, GROUND_Y - 12, tw.w - 16, 10);
+    ctx.restore();
+  });
+}
+
+function drawMizutsuneAttacks() {
+  waterJets.forEach(wj => {
+    ctx.save();
+    ctx.shadowColor = '#29b6f6';
+    ctx.shadowBlur = 14;
+    ctx.fillStyle = '#0288d1';
+    ctx.beginPath();
+    ctx.ellipse(wj.x, wj.y, wj.r * 1.8, wj.r * 0.85, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#e1f5fe';
+    ctx.beginPath();
+    ctx.ellipse(wj.x, wj.y, wj.r * 1.1, wj.r * 0.45, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  });
+
+  bubbleOrbs.forEach(bo => {
+    ctx.save();
+    ctx.shadowColor = '#f48fb1';
+    ctx.shadowBlur = 10;
+    ctx.fillStyle = 'rgba(248, 187, 208, 0.45)';
+    ctx.beginPath();
+    ctx.arc(bo.x, bo.y, bo.r, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = '#fce4ec';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(bo.x - bo.r * 0.35, bo.y - bo.r * 0.35, bo.r * 0.25, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  });
+}
+
+function drawQuestSelectScreen() {
+  ctx.save();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const bg = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  bg.addColorStop(0, '#1e1812');
+  bg.addColorStop(1, '#120e0b');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = '#8a6d3b';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(14, 14, canvas.width - 28, canvas.height - 28);
+
+  ctx.fillStyle = '#ffd700';
+  ctx.font = 'bold 26px sans-serif';
+  ctx.fillText('【 討伐クエスト選択ボード 】', 34, 54);
+
+  const wpn = getCurrentWeapon();
+  const typeLabel = getWeaponTypeLabel();
+  const totalAtk = getTotalAttack();
+  ctx.textAlign = 'right';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillStyle = '#ffd54f';
+  ctx.fillText(`現在装備: [${typeLabel}] ${wpn.name} (攻${totalAtk} / ${wpn.elementLabel})`, canvas.width - 34, 42);
+  ctx.fillStyle = '#a5d6a7';
+  ctx.fillText(`防具: ${getEquipSummaryText()}`, canvas.width - 34, 62);
+  ctx.textAlign = 'left';
+
+  ctx.fillStyle = '#ccc';
+  ctx.font = '13px sans-serif';
+  ctx.fillText('モンスターをクリックして出撃！（Ctrl: 装備変更 / F2: 弱点肉質表 / Q・E: ページ切替）', 36, 90);
+
+  const totalPages = Math.ceil(QUEST_LIST.length / QUESTS_PER_PAGE);
+  const btnRects = getPageBtnRects();
+  const btnLabels = ['◀ 前へ', '次へ ▶'];
+  btnRects.forEach((br, bi) => {
+    const isBtnHover = hoveredPageBtn === bi;
+    ctx.fillStyle = isBtnHover ? '#4a3b28' : '#2a2219';
+    ctx.fillRect(br.x, br.y, br.w, br.h);
+    ctx.strokeStyle = isBtnHover ? '#ffd700' : '#8a6d3b';
+    ctx.lineWidth = isBtnHover ? 2 : 1.5;
+    ctx.strokeRect(br.x, br.y, br.w, br.h);
+
+    ctx.fillStyle = isBtnHover ? '#ffd700' : '#eee';
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(btnLabels[bi], br.x + br.w / 2, br.y + 19);
+    ctx.textAlign = 'left';
+  });
+
+  ctx.fillStyle = '#ffd700';
+  ctx.font = 'bold 15px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(`${questPage + 1} / ${totalPages}`, 759, 91);
+  ctx.textAlign = 'left';
+
+  const pageStart = questPage * QUESTS_PER_PAGE;
+  const pageEnd = Math.min(QUEST_LIST.length, pageStart + QUESTS_PER_PAGE);
+  for (let idx = pageStart; idx < pageEnd; idx++) {
+    const q = QUEST_LIST[idx];
+    const slotIdx = idx - pageStart;
+    const r = getQuestCardRect(slotIdx);
+    const isHover = idx === hoveredQuestIndex;
+
+    ctx.fillStyle = isHover ? '#2e251c' : '#211b15';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+
+    ctx.fillStyle = q.themeColor;
+    ctx.fillRect(r.x, r.y, 10, r.h);
+
+    ctx.strokeStyle = isHover ? '#ffd700' : '#5c4934';
+    ctx.lineWidth = isHover ? 3 : 1.5;
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+
+    const badgeW = 54;
+    const badgeH = 26;
+    const badgeX = r.x + 22;
+    const badgeY = r.y + 14;
+    ctx.fillStyle = q.starLevel >= 3 ? '#6a1b9a' : (q.starLevel >= 2 ? '#b71c1c' : '#2e7d32');
+    ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
+    ctx.strokeStyle = q.starLevel >= 3 ? '#ea80fc' : (q.starLevel >= 2 ? '#ff8a80' : '#a5d6a7');
+    ctx.lineWidth = 1;
+    ctx.strokeRect(badgeX, badgeY, badgeW, badgeH);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(q.stars, badgeX + badgeW / 2, badgeY + 19);
+    ctx.textAlign = 'left';
+
+    ctx.fillStyle = isHover ? '#ffd700' : '#ffffff';
+    ctx.font = 'bold 19px sans-serif';
+    ctx.fillText(q.title, badgeX + badgeW + 12, r.y + 34);
+
+    ctx.fillStyle = '#bbb';
+    ctx.font = '13px sans-serif';
+    ctx.fillText(q.tag, r.x + 24, r.y + 66);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = q.borderColor;
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillText(q.hpText, r.x + r.w - 16, r.y + 34);
+
+    if (isHover) {
+      ctx.fillStyle = '#ffd700';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.fillText('▶ クリックで出撃！', r.x + r.w - 16, r.y + 68);
+    }
+    ctx.textAlign = 'left';
+  }
+
+  ctx.fillStyle = '#999';
+  ctx.font = '13px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('※戦闘中でも Mキー でいつでもこのクエスト選択画面に戻れます', canvas.width / 2, canvas.height - 26);
+  ctx.textAlign = 'left';
+
+  ctx.restore();
+}
+
+function drawWeaknessGuide() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const singleMonsters = QUEST_LIST.filter(q => !q.isMultiTarget);
+  const totalPages = Math.max(1, Math.ceil(singleMonsters.length / WEAKNESS_PER_PAGE));
+  if (weaknessPage >= totalPages) weaknessPage = 0;
+
+  const pageStart = weaknessPage * WEAKNESS_PER_PAGE;
+  const pageMonsters = singleMonsters.slice(pageStart, pageStart + WEAKNESS_PER_PAGE);
+
+  const rowH = 42;
+  const boxW = 820;
+  const boxH = 148 + WEAKNESS_PER_PAGE * rowH;
+  const boxX = (canvas.width - boxW) / 2;
+  const boxY = (canvas.height - boxH) / 2;
+
+  ctx.fillStyle = '#191714';
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.strokeStyle = '#ffd700';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+  ctx.fillStyle = '#ffd700';
+  ctx.font = 'bold 20px sans-serif';
+  ctx.fillText('【 ハンターノート：全モンスター属性肉質表 】', boxX + 22, boxY + 34);
+
+  // 右上にページ数表示
+  ctx.fillStyle = '#ffd700';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText(`◀  ${weaknessPage + 1} / ${totalPages} ページ  ▶`, boxX + boxW - 22, boxY + 34);
+  ctx.textAlign = 'left';
+
+  ctx.fillStyle = '#ccc';
+  ctx.font = '12px sans-serif';
+  ctx.fillText('数値が高いほど有効（50:大弱点 / 40:弱点 / 30:普通 / 25:耐性 / 10:大耐性 / ✕:無効）', boxX + 24, boxY + 55);
+
+  const tableX = boxX + 22;
+  const tableY = boxY + 66;
+  const colWidths = [276, 100, 100, 100, 100, 100];
+  const headers = [
+    { label: 'モンスター（難易度）', color: '#ffd700' },
+    { label: '火属性', color: '#ff7043' },
+    { label: '水属性', color: '#4fc3f7' },
+    { label: '雷属性', color: '#ffee58' },
+    { label: '氷属性', color: '#80deea' },
+    { label: '龍属性', color: '#ea80fc' }
+  ];
+
+  ctx.fillStyle = '#2c261f';
+  ctx.fillRect(tableX, tableY, colWidths.reduce((a, b) => a + b, 0), 34);
+  ctx.strokeStyle = '#6d583e';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(tableX, tableY, colWidths.reduce((a, b) => a + b, 0), 34);
+
+  let curX = tableX;
+  headers.forEach((h, i) => {
+    ctx.fillStyle = h.color;
+    ctx.font = 'bold 15px sans-serif';
+    if (i === 0) {
+      ctx.fillText(h.label, curX + 12, tableY + 23);
+    } else {
+      ctx.textAlign = 'center';
+      ctx.fillText(h.label, curX + colWidths[i] / 2, tableY + 23);
+      ctx.textAlign = 'left';
+    }
+    curX += colWidths[i];
+  });
+
+  const elemKeys = ['fire', 'water', 'thunder', 'ice', 'dragon'];
+  const totalW = colWidths.reduce((a, b) => a + b, 0);
+
+  for (let rowIdx = 0; rowIdx < WEAKNESS_PER_PAGE; rowIdx++) {
+    const rowY = tableY + 34 + rowIdx * rowH;
+    const q = pageMonsters[rowIdx];
+
+    if (!q) {
+      ctx.fillStyle = rowIdx % 2 === 0 ? '#1b1814' : '#161310';
+      ctx.fillRect(tableX, rowY, totalW, rowH);
+      ctx.strokeStyle = '#2d261e';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(tableX, rowY, totalW, rowH);
+      continue;
+    }
+
+    const isCurrentTarget = gameState === 'playing' && activeMonsters.some(m => m.hp > 0 && m.species === q.key);
+    ctx.fillStyle = isCurrentTarget
+      ? 'rgba(255, 215, 0, 0.14)'
+      : (rowIdx % 2 === 0 ? '#201c18' : '#181512');
+    ctx.fillRect(tableX, rowY, totalW, rowH);
+    ctx.strokeStyle = '#3d3328';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(tableX, rowY, totalW, rowH);
+
+    const monsterNames = {
+      rathalos: '火竜 リオレウス',
+      rathian: '雌火竜 リオレイア',
+      zinogre: '雷狼竜 ジンオウガ',
+      tobi: '飛雷竜 トビカガチ',
+      gore: '黒蝕竜 ゴア・マガラ',
+      barioth: '氷牙竜 ベリオロス',
+      mizutsune: '泡狐竜 タマミツネ',
+      kirin: '幻獣 キリン'
+    };
+    const mName = q.displayName || monsterNames[q.key] || q.title;
+
+    ctx.fillStyle = isCurrentTarget ? '#ffd700' : '#fff';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.fillText(`${mName} (${q.stars})`, tableX + 12, rowY + rowH * 0.65);
+
+    let cellX = tableX + colWidths[0];
+    const table = ELEMENT_EFFECTIVENESS[q.key] || { fire: 1, water: 1, thunder: 1, ice: 1, dragon: 1 };
+    elemKeys.forEach((ek, ei) => {
+      const mult = table[ek];
+      const valText = formatHitzoneDisplay(mult);
+
+      let valColor = '#cfd8dc';
+      if (valText === '50') valColor = '#ff5252';
+      else if (valText === '40') valColor = '#ffd740';
+      else if (valText === '30') valColor = '#ffffff';
+      else if (valText === '25') valColor = '#90a4ae';
+      else if (valText === '10') valColor = '#607d8b';
+      else if (valText === '✕') valColor = '#ef5350';
+
+      ctx.fillStyle = valColor;
+      ctx.font = valText === '50' || valText === '40' ? 'bold 18px sans-serif' : 'bold 16px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(valText, cellX + colWidths[ei + 1] / 2, rowY + rowH * 0.66);
+      ctx.textAlign = 'left';
+
+      cellX += colWidths[ei + 1];
+    });
+  }
+
+  ctx.fillStyle = '#ccc';
+  ctx.font = '13px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('← / →（A / D）: ページ切替 ｜ F2キー または Escキー で閉じる', canvas.width / 2, boxY + boxH - 14);
+  ctx.textAlign = 'left';
+
+  ctx.restore();
+}
+
+function drawBariothAttacks() {
+  iceBeams.forEach(beam => {
+    ctx.save();
+    const alpha = beam.life / beam.maxLife;
+    ctx.shadowColor = '#00e5ff';
+    ctx.shadowBlur = 16;
+
+    ctx.strokeStyle = `rgba(77, 208, 225, ${alpha * 0.85})`;
+    ctx.lineWidth = 22 * alpha + 6;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(beam.x1, beam.y1);
+    ctx.lineTo(beam.x2, beam.y2);
+    ctx.stroke();
+
+    ctx.strokeStyle = `rgba(224, 247, 250, ${alpha})`;
+    ctx.lineWidth = 9 * alpha + 2;
+    ctx.beginPath();
+    ctx.moveTo(beam.x1, beam.y1);
+    ctx.lineTo(beam.x2, beam.y2);
+    ctx.stroke();
+
+    ctx.fillStyle = `rgba(178, 235, 242, ${alpha * 0.8})`;
+    ctx.beginPath();
+    ctx.arc(beam.x2, beam.y2 - 6, 24 * alpha, Math.PI, 0);
+    ctx.fill();
+    ctx.restore();
+  });
+
+  iceSpears.forEach(spear => {
+    ctx.save();
+    const isCharging = spear.windupTimer > 0;
+    const midY = spear.y + spear.h / 2;
+
+    if (isCharging) {
+      ctx.strokeStyle = 'rgba(128, 222, 234, 0.28)';
+      ctx.setLineDash([10, 8]);
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(0, midY);
+      ctx.lineTo(canvas.width, midY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    ctx.shadowColor = '#00e5ff';
+    ctx.shadowBlur = isCharging ? 8 : 14;
+    ctx.fillStyle = isCharging ? 'rgba(128, 222, 234, 0.78)' : '#4dd0e1';
+
+    ctx.beginPath();
+    if (spear.dir === 1) {
+      ctx.moveTo(spear.x, midY - 6);
+      ctx.lineTo(spear.x + spear.w - 28, spear.y);
+      ctx.lineTo(spear.x + spear.w, midY);
+      ctx.lineTo(spear.x + spear.w - 28, spear.y + spear.h);
+      ctx.lineTo(spear.x, midY + 6);
+    } else {
+      ctx.moveTo(spear.x + spear.w, midY - 6);
+      ctx.lineTo(spear.x + 28, spear.y);
+      ctx.lineTo(spear.x, midY);
+      ctx.lineTo(spear.x + 28, spear.y + spear.h);
+      ctx.lineTo(spear.x + spear.w, midY + 6);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = '#e0f7fa';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(spear.x + 14, midY);
+    ctx.lineTo(spear.x + spear.w - 14, midY);
+    ctx.stroke();
+
+    ctx.restore();
+  });
+}
+
+function drawFrenzySpreadClouds() {
+  frenzySpreadClouds.forEach(cloud => {
+    ctx.save();
+    const fade = Math.min(1, cloud.timer / 30);
+    const centerX = cloud.x + cloud.w / 2;
+
+    const grad = ctx.createLinearGradient(0, cloud.y, 0, GROUND_Y);
+    grad.addColorStop(0, `rgba(170, 0, 255, ${0.08 * fade})`);
+    grad.addColorStop(1, `rgba(106, 27, 154, ${0.58 * fade})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(cloud.x, cloud.y, cloud.w, cloud.h);
+
+    ctx.fillStyle = `rgba(224, 64, 251, ${0.75 * fade})`;
+    ctx.fillRect(cloud.x, GROUND_Y - 4, cloud.w, 4);
+
+    const puffs = Math.floor(cloud.w / 32);
+    for (let j = 0; j <= puffs; j++) {
+      const px = cloud.x + (cloud.w / puffs) * j;
+      const waveY = Math.sin(Date.now() * 0.008 + j) * 4;
+      ctx.fillStyle = `rgba(142, 36, 170, ${0.32 * fade})`;
+      ctx.beginPath();
+      ctx.arc(px, GROUND_Y - 12 + waveY, 18, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.fillStyle = `rgba(243, 229, 245, ${0.45 * fade})`;
+    const ratio = cloud.timer / cloud.maxTimer;
+    ctx.fillRect(centerX - 24 * ratio, cloud.y - 6, 48 * ratio, 2);
+
+    ctx.restore();
+  });
+}
+
+function drawFrenzyBombs() {
+  frenzyOrbs.forEach(orb => {
+    ctx.save();
+    const urgency = 1 - (orb.timer / 90);
+    const pulseR = orb.r + Math.sin(orb.timer * 0.35) * 3 + urgency * 7;
+
+    ctx.fillStyle = `rgba(170, 0, 255, ${0.15 + urgency * 0.25})`;
+    ctx.fillRect(orb.x - 52, GROUND_Y - 5, 104, 5);
+
+    ctx.shadowColor = '#d500f9';
+    ctx.shadowBlur = 12 + urgency * 14;
+    ctx.beginPath();
+    ctx.arc(orb.x, orb.y, pulseR, 0, Math.PI * 2);
+    ctx.fillStyle = '#4a148c';
+    ctx.fill();
+
+    if (orb.timer > 24 || Math.floor(orb.timer / 3) % 2 === 0) {
+      ctx.beginPath();
+      ctx.arc(orb.x, orb.y, pulseR * 0.58, 0, Math.PI * 2);
+      ctx.fillStyle = '#e040fb';
+      ctx.fill();
+    }
+    ctx.restore();
+  });
+
+  frenzyExplosions.forEach(exp => {
+    ctx.save();
+    const alpha = exp.life / 16;
+    ctx.fillStyle = `rgba(170, 0, 255, ${alpha * 0.65})`;
+    ctx.beginPath();
+    ctx.arc(exp.x, exp.y, exp.r * (1.15 - alpha * 0.25), 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = `rgba(243, 229, 245, ${alpha * 0.85})`;
+    ctx.beginPath();
+    ctx.arc(exp.x, exp.y, exp.r * 0.45, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  });
+}
+
+function drawLightningClouds() {
+  lightningClouds.forEach(lc => {
+    ctx.save();
+    const urgency = 1 - (lc.timer / 90);
+
+    ctx.fillStyle = `rgba(128, 216, 255, ${0.12 + urgency * 0.25})`;
+    ctx.fillRect(lc.x - 20, GROUND_Y - 4, 40, 4);
+
+    ctx.shadowColor = '#00e5ff';
+    ctx.shadowBlur = 10 + urgency * 12;
+    ctx.fillStyle = '#37474f';
+    ctx.beginPath();
+    ctx.arc(lc.x - 16, lc.y + 4, 15, 0, Math.PI * 2);
+    ctx.arc(lc.x, lc.y - 2, 19, 0, Math.PI * 2);
+    ctx.arc(lc.x + 16, lc.y + 4, 15, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (lc.timer > 25 || Math.floor(lc.timer / 3) % 2 === 0) {
+      ctx.fillStyle = `rgba(179, 229, 252, ${0.35 + urgency * 0.5})`;
+      ctx.beginPath();
+      ctx.arc(lc.x, lc.y + 3, 12, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  });
+}
+
+function drawLightningBolts() {
+  lightningBolts.forEach(lb => {
+    ctx.save();
+    const alpha = lb.life / 14;
+    ctx.strokeStyle = `rgba(128, 216, 255, ${alpha})`;
+    ctx.lineWidth = 14;
+    ctx.beginPath();
+    ctx.moveTo(lb.x, lb.topY);
+    ctx.lineTo(lb.x - 8, (lb.topY + lb.bottomY) * 0.35);
+    ctx.lineTo(lb.x + 8, (lb.topY + lb.bottomY) * 0.68);
+    ctx.lineTo(lb.x, lb.bottomY);
+    ctx.stroke();
+
+    ctx.strokeStyle = `rgba(255, 255, 255, ${alpha})`;
+    ctx.lineWidth = 5;
+    ctx.stroke();
+    ctx.restore();
+  });
+}
+
+function drawPlayer() {
+  ctx.save();
+  if (player.invulnTimer > 0 && Math.floor(player.invulnTimer / 3) % 2 === 0) {
+    ctx.globalAlpha = 0.5;
+  }
+
+  const paraJitter = player.paralysisTimer > 0 ? (Math.random() - 0.5) * 4 : 0;
+  const px = player.x + paraJitter;
+  const py = player.y;
+
+  const headItem = ARMOR_DB.head[player.equipment.head];
+  const chestItem = ARMOR_DB.chest[player.equipment.chest];
+  const armsItem = ARMOR_DB.arms[player.equipment.arms];
+  const waistItem = ARMOR_DB.waist[player.equipment.waist];
+  const legsItem = ARMOR_DB.legs[player.equipment.legs];
+
+  if (chestItem.series === 'mizutsune') {
+    ctx.fillStyle = '#fce4ec';
+    ctx.fillRect(px + 5, py - 45, 20, 28);
+    ctx.fillStyle = '#ec407a';
+    ctx.fillRect(px + 5, py - 45, 20, 6);
+  } else if (chestItem.series === 'kirin') {
+    ctx.fillStyle = '#eceff1';
+    ctx.fillRect(px + 5, py - 45, 20, 26);
+    ctx.fillStyle = '#4fc3f7';
+    ctx.fillRect(px + 5, py - 45, 20, 5);
+  } else if (chestItem.series === 'rathalos') {
+    ctx.fillStyle = '#9e1c1c';
+    ctx.fillRect(px + 5, py - 45, 20, 30);
+    ctx.fillStyle = '#d4af37';
+    ctx.fillRect(px + 5, py - 45, 20, 6);
+  } else if (chestItem.series === 'hunter') {
+    ctx.fillStyle = '#4e6e48';
+    ctx.fillRect(px + 5, py - 45, 20, 30);
+    ctx.fillStyle = '#8d6e63';
+    ctx.fillRect(px + 5, py - 45, 20, 6);
+  } else {
+    ctx.fillStyle = '#d2a679';
+    ctx.fillRect(px + 5, py - 45, 20, 30);
+  }
+
+  if (armsItem.series === 'mizutsune') {
+    ctx.fillStyle = '#f8bbd0';
+    ctx.fillRect(px + (player.facing === 1 ? 18 : 4), py - 38, 8, 14);
+  } else if (armsItem.series === 'kirin') {
+    ctx.fillStyle = '#e1f5fe';
+    ctx.fillRect(px + (player.facing === 1 ? 18 : 4), py - 38, 8, 14);
+  } else if (armsItem.series === 'rathalos') {
+    ctx.fillStyle = '#b71c1c';
+    ctx.fillRect(px + (player.facing === 1 ? 18 : 4), py - 38, 8, 14);
+  } else if (armsItem.series === 'hunter') {
+    ctx.fillStyle = '#5d4037';
+    ctx.fillRect(px + (player.facing === 1 ? 18 : 4), py - 38, 8, 14);
+  }
+
+  if (waistItem.series === 'mizutsune') {
+    ctx.fillStyle = '#ad1457';
+    ctx.fillRect(px + 3, py - 19, 24, 6);
+  } else if (waistItem.series === 'kirin') {
+    ctx.fillStyle = '#b3e5fc';
+    ctx.fillRect(px + 3, py - 19, 24, 6);
+  } else if (waistItem.series === 'rathalos') {
+    ctx.fillStyle = '#880e0e';
+    ctx.fillRect(px + 4, py - 18, 22, 6);
+  } else if (waistItem.series === 'hunter') {
+    ctx.fillStyle = '#6d4c41';
+    ctx.fillRect(px + 4, py - 18, 22, 6);
+  }
+
+  if (legsItem.series === 'mizutsune') {
+    ctx.fillStyle = '#f48fb1';
+  } else if (legsItem.series === 'kirin') {
+    ctx.fillStyle = '#cfd8dc';
+  } else if (legsItem.series === 'rathalos') {
+    ctx.fillStyle = '#7f1414';
+  } else if (legsItem.series === 'hunter') {
+    ctx.fillStyle = '#3e5638';
+  } else {
+    ctx.fillStyle = '#3b4252';
+  }
+  ctx.fillRect(px + 6, py - 15, 18, 15);
+
+  ctx.fillStyle = '#e5c29f';
+  ctx.beginPath();
+  ctx.arc(px + 15, py - 53, 9, 0, Math.PI * 2);
+  ctx.fill();
+  if (headItem.series === 'mizutsune') {
+    ctx.fillStyle = '#fce4ec';
+    ctx.beginPath();
+    ctx.arc(px + 15, py - 54, 10, Math.PI, 0);
+    ctx.fill();
+    ctx.fillStyle = '#ec407a';
+    ctx.fillRect(px + 7, py - 63, 4, 5);
+    ctx.fillRect(px + 19, py - 63, 4, 5);
+  } else if (headItem.series === 'kirin') {
+    ctx.fillStyle = '#eceff1';
+    ctx.fillRect(px + 6, py - 59, 18, 5);
+    ctx.fillStyle = '#29b6f6';
+    ctx.beginPath();
+    const hornBase = px + 15 + player.facing * 4;
+    ctx.moveTo(hornBase - 2, py - 59);
+    ctx.lineTo(hornBase + player.facing * 8, py - 71);
+    ctx.lineTo(hornBase + 2, py - 59);
+    ctx.fill();
+  } else if (headItem.series === 'rathalos') {
+    ctx.fillStyle = '#a81c1c';
+    ctx.beginPath();
+    ctx.arc(px + 15, py - 54, 10, Math.PI, 0);
+    ctx.fill();
+    ctx.fillStyle = '#ffd54f';
+    ctx.fillRect(px + 8, py - 65, 3, 6);
+    ctx.fillRect(px + 19, py - 65, 3, 6);
+  } else if (headItem.series === 'hunter') {
+    ctx.fillStyle = '#4e6e48';
+    ctx.beginPath();
+    ctx.arc(px + 15, py - 54, 10, Math.PI, 0);
+    ctx.fill();
+    ctx.fillStyle = '#d7ccc8';
+    ctx.fillRect(px + 13, py - 65, 4, 5);
+  } else {
+    ctx.fillStyle = '#c0392b';
+    ctx.fillRect(px + 6, py - 57, 18, 4);
+  }
+
+  if (player.bubbleTimer > 0) {
+    ctx.strokeStyle = '#f8bbd0';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(px + 15, py - 24, 18, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  if (player.paralysisTimer > 0) {
+    ctx.strokeStyle = '#ffee00';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(px + 2, py - 62, 26, 62);
+  }
+
+  if (player.state === 'gsTackle') {
+    ctx.strokeStyle = '#ffd54f';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(px + (player.facing === 1 ? 12 : -4), py - 56, 22, 52);
+  }
+
+  const weapon = getCurrentWeapon();
+  const isCustomWeapon = (EXTRA.weaponTypes || []).some(t => t.key === player.weaponType);
+  const isGS = player.weaponType === 'greatsword';
+  const isDB = player.weaponType === 'dualblades';
+  const handX = px + 15;
+  const handY = py - 32;
+
+  if (isCustomWeapon && typeof EXTRA_HOOKS.onDrawPlayerWeapon === 'function') {
+    EXTRA_HOOKS.onDrawPlayerWeapon(handX, handY, getHookContext());
+  } else if (isDB) {
+    const isThunderWeapon = weapon.element === 'thunder';
+    const isFireWeapon = weapon.element === 'fire';
+    const isWaterWeapon = weapon.element === 'water';
+    const bladeCol = isThunderWeapon ? '#4dd0e1' : (isFireWeapon ? '#ff7043' : (isWaterWeapon ? '#4fc3f7' : '#cfd8dc'));
+    const edgeCol = isThunderWeapon ? '#ffee58' : '#ffffff';
+
+    ctx.save();
+    if (player.demonMode || isThunderWeapon) {
+      ctx.shadowColor = player.demonMode ? '#ff1744' : '#00e5ff';
+      ctx.shadowBlur = player.demonMode ? 14 : 9;
+    }
+
+    const isSlashing = player.state === 'dbSlash' || player.state === 'dbSpinDash';
+    for (let b = 0; b < 2; b++) {
+      const offsetY = b === 0 ? -4 : 6;
+      const angle = isSlashing
+        ? (player.facing === 1 ? -0.3 + b * 0.55 : Math.PI + 0.3 - b * 0.55)
+        : (player.facing === 1 ? -0.9 + b * 0.45 : Math.PI + 0.9 - b * 0.45);
+      ctx.save();
+      ctx.translate(handX + (b === 1 ? -player.facing * 6 : 0), handY + offsetY);
+      ctx.rotate(angle);
+      ctx.fillStyle = bladeCol;
+      ctx.fillRect(0, -3, 46, 6);
+      ctx.fillStyle = edgeCol;
+      ctx.fillRect(4, -1.5, 40, 2);
+      ctx.restore();
+    }
+
+    if (isSlashing) {
+      ctx.fillStyle = player.demonMode ? 'rgba(255, 23, 68, 0.35)' : (isThunderWeapon ? 'rgba(0, 229, 255, 0.34)' : 'rgba(255, 255, 255, 0.3)');
+      ctx.beginPath();
+      ctx.arc(handX, handY, 64, player.facing === 1 ? -0.9 : Math.PI - 0.6, player.facing === 1 ? 0.6 : Math.PI + 0.9);
+      ctx.lineTo(handX, handY);
+      ctx.fill();
+    }
+    ctx.restore();
+  } else if (isGS) {
+    const isFireWeapon = weapon.element === 'fire';
+    const isIceWeapon = weapon.element === 'ice';
+    const isDragonWeapon = weapon.element === 'dragon';
+    const chargeColors = ['#b0bec5', '#ffffff', '#ffd700', '#ff3d00'];
+    const glowColor = player.state === 'gsCharge' || player.state === 'gsChargeSlash'
+      ? chargeColors[player.chargeLevel]
+      : (isFireWeapon ? '#ff6d00'
+        : (isIceWeapon ? '#00e5ff'
+          : (isDragonWeapon ? '#d500f9' : 'transparent')));
+
+    ctx.save();
+    ctx.translate(handX, handY);
+
+    let angle = player.facing === 1 ? -2.35 : -0.78;
+    if (player.state === 'gsCharge') {
+      angle = player.facing === 1 ? -1.85 : -1.29;
+    } else if (player.state === 'attack' || player.state === 'gsChargeSlash') {
+      angle = player.facing === 1 ? 0.1 : Math.PI - 0.1;
+    }
+    ctx.rotate(angle);
+
+    if (glowColor !== 'transparent') {
+      ctx.shadowColor = glowColor;
+      ctx.shadowBlur = player.state === 'gsCharge' ? 8 + player.chargeLevel * 6 : 12;
+    }
+
+    ctx.fillStyle = isDragonWeapon ? '#212121'
+      : (isFireWeapon ? '#b71c1c'
+        : (isIceWeapon ? '#00838f' : '#90a4ae'));
+    ctx.beginPath();
+    ctx.moveTo(0, -6);
+    ctx.lineTo(82, -8);
+    ctx.lineTo(96, 0);
+    ctx.lineTo(82, 8);
+    ctx.lineTo(0, 6);
+    ctx.closePath();
+    ctx.fill();
+
+    if (isDragonWeapon) {
+      ctx.fillStyle = '#aa00ff';
+      ctx.fillRect(6, -3, 72, 6);
+      ctx.fillStyle = '#e040fb';
+      ctx.fillRect(12, -11, 14, 22);
+    } else if (isIceWeapon) {
+      ctx.fillStyle = '#e0f7fa';
+      ctx.fillRect(6, -3, 72, 6);
+      ctx.fillStyle = '#4dd0e1';
+      ctx.fillRect(12, -11, 14, 22);
+    } else if (isFireWeapon) {
+      ctx.fillStyle = '#ffab00';
+      ctx.fillRect(6, -3, 68, 6);
+      ctx.fillStyle = '#ff3d00';
+      ctx.fillRect(14, -10, 12, 20);
+    } else {
+      ctx.fillStyle = '#cfd8dc';
+      ctx.fillRect(4, -2, 76, 4);
+      ctx.fillStyle = '#546e7a';
+      ctx.fillRect(0, -9, 8, 18);
+    }
+
+    ctx.restore();
+
+    if (player.state === 'attack' || player.state === 'gsChargeSlash') {
+      ctx.fillStyle = player.state === 'gsChargeSlash'
+        ? (isDragonWeapon ? 'rgba(170, 0, 255, 0.44)'
+          : (isFireWeapon ? 'rgba(255, 87, 34, 0.42)'
+            : (isIceWeapon ? 'rgba(77, 208, 225, 0.42)' : 'rgba(255, 215, 0, 0.38)')))
+        : (isDragonWeapon ? 'rgba(213, 0, 249, 0.32)'
+          : (isIceWeapon ? 'rgba(128, 222, 234, 0.34)' : 'rgba(255, 255, 255, 0.3)'));
+      ctx.beginPath();
+      ctx.arc(handX, handY, 96, player.facing === 1 ? -1.1 : Math.PI - 0.4, player.facing === 1 ? 0.4 : Math.PI + 1.1);
+      ctx.lineTo(handX, handY);
+      ctx.fill();
+    }
+  } else {
+    const isFireWeapon = weapon.element === 'fire';
+    const isWaterWeapon = weapon.element === 'water';
+    const isThunderWeapon = weapon.element === 'thunder';
+    const isIceWeapon = weapon.element === 'ice';
+    const isDragonWeapon = weapon.element === 'dragon';
+    const auraColors = isDragonWeapon
+      ? ['#ce93d8', '#f3e5f5', '#ffd700', '#ff2222']
+      : (isFireWeapon
+        ? ['#ff7043', '#ffe0b2', '#ffd700', '#ff2222']
+        : (isWaterWeapon
+          ? ['#4fc3f7', '#e1f5fe', '#ffd700', '#ff2222']
+          : (isIceWeapon
+            ? ['#80deea', '#e0f7fa', '#ffd700', '#ff2222']
+            : (isThunderWeapon
+              ? ['#4dd0e1', '#e0f7fa', '#ffd700', '#ff2222']
+              : ['#cccccc', '#ffffff', '#ffd700', '#ff2222']))));
+    const bladeColor = auraColors[player.spiritLevel];
+
+    ctx.strokeStyle = bladeColor;
+    ctx.lineWidth = (isFireWeapon || isWaterWeapon || isThunderWeapon || isIceWeapon || isDragonWeapon) ? 4.5 : 4;
+    ctx.shadowColor = player.spiritLevel === 0
+      ? (isDragonWeapon ? '#d500f9'
+        : (isFireWeapon ? '#ff3d00'
+          : (isWaterWeapon ? '#03a9f4'
+            : (isIceWeapon ? '#4dd0e1'
+              : (isThunderWeapon ? '#00e5ff' : 'transparent')))))
+      : bladeColor;
+    ctx.shadowBlur = (isFireWeapon || isWaterWeapon || isThunderWeapon || isIceWeapon || isDragonWeapon) ? Math.max(9, player.spiritLevel * 7) : player.spiritLevel * 6;
+
+    ctx.beginPath();
+    ctx.moveTo(handX, handY);
+
+    if (player.state === 'attack' || player.state === 'spiritAttack' || (player.state === 'foresight' && player.stateTimer <= 12)) {
+      ctx.lineTo(handX + player.facing * 85, handY - 10);
+      ctx.stroke();
+      if (isFireWeapon) {
+        ctx.strokeStyle = '#ffd54f';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX + player.facing * 42, handY - 5);
+        ctx.stroke();
+      } else if (isWaterWeapon) {
+        ctx.strokeStyle = '#f8bbd0';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX + player.facing * 42, handY - 5);
+        ctx.stroke();
+      } else if (isThunderWeapon) {
+        ctx.strokeStyle = '#ffd54f';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX + player.facing * 35, handY - 4);
+        ctx.stroke();
+      } else if (isIceWeapon) {
+        ctx.strokeStyle = '#e0f7fa';
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX + player.facing * 40, handY - 5);
+        ctx.stroke();
+      } else if (isDragonWeapon) {
+        ctx.strokeStyle = '#311b92';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX + player.facing * 42, handY - 5);
+        ctx.stroke();
+      }
+      ctx.fillStyle = player.state === 'spiritAttack'
+        ? (isDragonWeapon ? 'rgba(213, 0, 249, 0.42)'
+          : (isFireWeapon ? 'rgba(255, 87, 34, 0.42)'
+            : (isWaterWeapon ? 'rgba(41, 182, 246, 0.40)'
+              : (isIceWeapon ? 'rgba(77, 208, 225, 0.40)'
+                : (isThunderWeapon ? 'rgba(0, 229, 255, 0.38)' : 'rgba(255, 50, 50, 0.35)')))))
+        : (isDragonWeapon ? 'rgba(224, 64, 251, 0.34)'
+          : (isFireWeapon ? 'rgba(255, 138, 101, 0.36)'
+            : (isWaterWeapon ? 'rgba(129, 212, 250, 0.36)'
+              : (isIceWeapon ? 'rgba(178, 235, 242, 0.36)'
+                : (isThunderWeapon ? 'rgba(128, 222, 234, 0.34)' : 'rgba(255, 255, 255, 0.3)')))));
+      ctx.beginPath();
+      ctx.arc(handX, handY, 85, player.facing === 1 ? -0.8 : Math.PI - 0.5, player.facing === 1 ? 0.5 : Math.PI + 0.8);
+      ctx.lineTo(handX, handY);
+      ctx.fill();
+    } else {
+      ctx.lineTo(handX - player.facing * 55, handY - 45);
+      ctx.stroke();
+      if (isFireWeapon) {
+        ctx.strokeStyle = '#ffd54f';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX - player.facing * 26, handY - 21);
+        ctx.stroke();
+      } else if (isWaterWeapon) {
+        ctx.strokeStyle = '#f8bbd0';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX - player.facing * 26, handY - 21);
+        ctx.stroke();
+      } else if (isThunderWeapon) {
+        ctx.strokeStyle = '#ffd54f';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX - player.facing * 24, handY - 20);
+        ctx.stroke();
+      } else if (isIceWeapon) {
+        ctx.strokeStyle = '#e0f7fa';
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX - player.facing * 25, handY - 20);
+        ctx.stroke();
+      } else if (isDragonWeapon) {
+        ctx.strokeStyle = '#311b92';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(handX, handY);
+        ctx.lineTo(handX - player.facing * 26, handY - 21);
+        ctx.stroke();
+      }
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawSingleMonster(m) {
+  // 外部箱の描画フック
+  if (typeof EXTRA_HOOKS.onDrawMonster === 'function') {
+    const handled = EXTRA_HOOKS.onDrawMonster(m, getHookContext());
+    if (handled) return;
+  }
+
+  ctx.save();
+  const rx = m.x;
+  const ry = m.y;
+  const rw = m.w;
+  const rh = m.h;
+  const sp = m.species;
+
+  const centerX = rx + rw / 2;
+  const centerY = ry - rh / 2;
+  ctx.translate(centerX, centerY);
+  if (m.somersaultAngle !== 0) {
+    ctx.rotate(m.somersaultAngle);
+  }
+  if (m.state === 'poisonTail' && m.stateTimer > 38) {
+    ctx.translate(0, 12);
+    ctx.scale(1.06, 0.86);
+  }
+  ctx.translate(-centerX, -centerY);
+
+  if (sp === 'tobi') {
+    ctx.shadowColor = '#ffee58';
+    ctx.shadowBlur = 14;
+
+    ctx.fillStyle = 'rgba(224, 242, 241, 0.55)';
+    ctx.beginPath();
+    ctx.moveTo(rx + 25, ry - rh + 32);
+    ctx.lineTo(rx + rw / 2, ry - rh + 14);
+    ctx.lineTo(rx + rw - 25, ry - rh + 32);
+    ctx.fill();
+
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#546e7a';
+    ctx.beginPath();
+    ctx.roundRect(rx + 14, ry - rh + 28, rw - 28, rh - 40, 12);
+    ctx.fill();
+
+    ctx.fillStyle = '#fff9c4';
+    ctx.beginPath();
+    ctx.moveTo(rx + 26, ry - rh + 28);
+    ctx.lineTo(rx + 42, ry - rh + 12);
+    ctx.lineTo(rx + 56, ry - rh + 28);
+    ctx.lineTo(rx + 70, ry - rh + 14);
+    ctx.lineTo(rx + 84, ry - rh + 28);
+    ctx.fill();
+
+    ctx.strokeStyle = '#eceff1';
+    ctx.lineWidth = 15;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    const tailBaseX = m.facing === 1 ? rx + 14 : rx + rw - 14;
+    ctx.moveTo(tailBaseX, ry - 34);
+    ctx.lineTo(tailBaseX - m.facing * 72, ry - 52 + Math.sin(Date.now() * 0.015) * 9);
+    ctx.stroke();
+
+    const headX = m.facing === 1 ? rx + rw - 28 : rx - 8;
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#607d8b';
+    ctx.fillRect(headX, ry - rh + 18, 36, 22);
+
+    ctx.fillStyle = '#ffee58';
+    ctx.fillRect(m.facing === 1 ? headX + 22 : headX + 8, ry - rh + 22, 6, 4);
+
+    ctx.fillStyle = '#37474f';
+    ctx.fillRect(rx + 24, ry - 16, 14, 16);
+    ctx.fillRect(rx + rw - 38, ry - 16, 14, 16);
+
+    ctx.restore();
+    return;
+  }
+
+  if (sp === 'mizutsune') {
+    ctx.shadowColor = '#f48fb1';
+    ctx.shadowBlur = 14;
+
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#fce4ec';
+    ctx.beginPath();
+    ctx.roundRect(rx + 12, ry - rh + 28, rw - 24, rh - 40, 14);
+    ctx.fill();
+
+    ctx.fillStyle = '#ec407a';
+    ctx.beginPath();
+    ctx.moveTo(rx + 26, ry - rh + 28);
+    ctx.lineTo(rx + 44, ry - rh + 10);
+    ctx.lineTo(rx + 60, ry - rh + 28);
+    ctx.lineTo(rx + 76, ry - rh + 12);
+    ctx.lineTo(rx + 88, ry - rh + 28);
+    ctx.fill();
+
+    ctx.strokeStyle = '#f06292';
+    ctx.lineWidth = 13;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    const tailBaseX = m.facing === 1 ? rx + 12 : rx + rw - 12;
+    ctx.moveTo(tailBaseX, ry - 32);
+    ctx.lineTo(tailBaseX - m.facing * 72, ry - 48 + Math.sin(Date.now() * 0.012) * 10);
+    ctx.stroke();
+
+    const headX = m.facing === 1 ? rx + rw - 28 : rx - 8;
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#f8bbd0';
+    ctx.fillRect(headX, ry - rh + 16, 36, 24);
+
+    ctx.fillStyle = '#ad1457';
+    ctx.beginPath();
+    ctx.moveTo(headX + 12, ry - rh + 16);
+    ctx.lineTo(headX + (m.facing === 1 ? 2 : 34), ry - rh + 2);
+    ctx.lineTo(headX + 24, ry - rh + 16);
+    ctx.fill();
+
+    ctx.fillStyle = '#00e5ff';
+    ctx.fillRect(m.facing === 1 ? headX + 22 : headX + 8, ry - rh + 21, 6, 4);
+
+    ctx.fillStyle = '#880e4f';
+    ctx.fillRect(rx + 24, ry - 16, 14, 16);
+    ctx.fillRect(rx + rw - 38, ry - 16, 14, 16);
+
+    ctx.restore();
+    return;
+  }
+
+  if (sp === 'barioth') {
+    ctx.shadowColor = '#80deea';
+    ctx.shadowBlur = 12;
+
+    const wingFlap = Math.sin(Date.now() * 0.018) * (m.isFlying ? 24 : 7);
+    ctx.fillStyle = '#cfd8dc';
+    ctx.beginPath();
+    ctx.moveTo(rx + rw / 2, ry - rh + 24);
+    ctx.lineTo(rx + rw / 2 - m.facing * 78, ry - rh - 26 + wingFlap);
+    ctx.lineTo(rx + rw / 2 - m.facing * 22, ry - rh + 42);
+    ctx.fill();
+
+    ctx.fillStyle = '#4dd0e1';
+    ctx.beginPath();
+    ctx.arc(rx + rw / 2 - m.facing * 78, ry - rh - 26 + wingFlap, 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#eceff1';
+    ctx.beginPath();
+    ctx.roundRect(rx + 15, ry - rh + 22, rw - 30, rh - 32, 14);
+    ctx.fill();
+
+    ctx.fillStyle = '#b2ebf2';
+    ctx.beginPath();
+    ctx.moveTo(rx + 28, ry - rh + 22);
+    ctx.lineTo(rx + 46, ry - rh + 10);
+    ctx.lineTo(rx + 64, ry - rh + 22);
+    ctx.lineTo(rx + 80, ry - rh + 12);
+    ctx.lineTo(rx + 90, ry - rh + 22);
+    ctx.fill();
+
+    ctx.strokeStyle = '#b0bec5';
+    ctx.lineWidth = 10;
+    ctx.beginPath();
+    const tailBaseX = m.facing === 1 ? rx + 15 : rx + rw - 15;
+    ctx.moveTo(tailBaseX, ry - 32);
+    ctx.lineTo(tailBaseX - m.facing * 64, ry - 44 + Math.sin(Date.now() * 0.01) * 8);
+    ctx.stroke();
+
+    const headX = m.facing === 1 ? rx + rw - 28 : rx - 8;
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#f5f5f5';
+    ctx.fillRect(headX, ry - rh + 12, 36, 26);
+
+    ctx.fillStyle = '#ff6d00';
+    ctx.fillRect(m.facing === 1 ? headX + 20 : headX + 8, ry - rh + 17, 6, 4);
+
+    ctx.fillStyle = '#ffb300';
+    ctx.beginPath();
+    const fangX = m.facing === 1 ? headX + 28 : headX + 8;
+    ctx.moveTo(fangX - 3, ry - rh + 36);
+    ctx.lineTo(fangX + m.facing * 4, ry - rh + 54);
+    ctx.lineTo(fangX + 4, ry - rh + 36);
+    ctx.fill();
+
+    if ((m.state === 'bariothAerialBeam' || m.state === 'bariothIceSpear') && m.stateTimer > 22) {
+      ctx.fillStyle = '#80deea';
+      ctx.beginPath();
+      ctx.arc(m.facing === 1 ? headX + 36 : headX, ry - rh + 26, 10, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.fillStyle = '#90a4ae';
+    ctx.fillRect(rx + 28, ry - 16, 14, 16);
+    ctx.fillRect(rx + rw - 42, ry - 16, 14, 16);
+
+    ctx.restore();
+    return;
+  }
+
+  if (sp === 'gore') {
+    if (m.isFrenzied) {
+      ctx.shadowColor = '#d500f9';
+      ctx.shadowBlur = 20;
+    }
+
+    const wingRaise = m.state === 'goreSlam' && m.stateTimer > 22 ? -35 : Math.sin(Date.now() * 0.01) * 6;
+    ctx.fillStyle = m.isFrenzied ? '#1a0026' : '#121216';
+    ctx.beginPath();
+    ctx.moveTo(rx + rw / 2, ry - rh + 22);
+    ctx.lineTo(rx + rw / 2 - m.facing * 85, ry - rh - 35 + wingRaise);
+    ctx.lineTo(rx + rw / 2 - m.facing * 25, ry - 18);
+    ctx.fill();
+
+    ctx.fillStyle = m.isFrenzied ? '#e040fb' : '#7b1fa2';
+    ctx.beginPath();
+    ctx.arc(rx + rw / 2 - m.facing * 85, ry - rh - 35 + wingRaise, 8, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : (m.isFrenzied ? '#241433' : '#1c1c24');
+    ctx.beginPath();
+    ctx.roundRect(rx + 14, ry - rh + 22, rw - 28, rh - 32, 14);
+    ctx.fill();
+
+    ctx.strokeStyle = '#181820';
+    ctx.lineWidth = 11;
+    ctx.beginPath();
+    const tailBaseX = m.facing === 1 ? rx + 14 : rx + rw - 14;
+    ctx.moveTo(tailBaseX, ry - 30);
+    ctx.lineTo(tailBaseX - m.facing * 68, ry - 44 + Math.sin(Date.now() * 0.009) * 9);
+    ctx.stroke();
+
+    const headX = m.facing === 1 ? rx + rw - 28 : rx - 8;
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#14141c';
+    ctx.fillRect(headX, ry - rh + 12, 36, 26);
+
+    if (m.isFrenzied) {
+      ctx.fillStyle = '#e040fb';
+      ctx.beginPath();
+      const hornX = headX + 18;
+      ctx.moveTo(hornX - 4, ry - rh + 12);
+      ctx.lineTo(hornX - m.facing * 12, ry - rh - 18);
+      ctx.lineTo(hornX + 4, ry - rh + 12);
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.moveTo(hornX + 2, ry - rh + 12);
+      ctx.lineTo(hornX + m.facing * 8, ry - rh - 14);
+      ctx.lineTo(hornX + 9, ry - rh + 12);
+      ctx.fill();
+    }
+
+    if ((m.state === 'goreExplodeBreath' || m.state === 'goreSpreadBreath') && m.stateTimer > 22) {
+      ctx.fillStyle = m.state === 'goreSpreadBreath' ? '#aa00ff' : '#d500f9';
+      ctx.beginPath();
+      ctx.arc(m.facing === 1 ? headX + 36 : headX, ry - rh + 26, 11, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.fillStyle = '#111116';
+    ctx.fillRect(rx + 28, ry - 16, 15, 16);
+    ctx.fillRect(rx + rw - 43, ry - 16, 15, 16);
+
+    ctx.restore();
+    return;
+  }
+
+  if (sp === 'kirin') {
+    ctx.shadowColor = '#80d8ff';
+    ctx.shadowBlur = 14;
+
+    ctx.fillStyle = '#e1f5fe';
+    ctx.beginPath();
+    ctx.moveTo(rx + 25, ry - rh + 28);
+    ctx.lineTo(rx + 45, ry - rh + 12);
+    ctx.lineTo(rx + 65, ry - rh + 28);
+    ctx.lineTo(rx + 82, ry - rh + 14);
+    ctx.lineTo(rx + 92, ry - rh + 28);
+    ctx.fill();
+
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#eceff1';
+    ctx.beginPath();
+    ctx.roundRect(rx + 18, ry - rh + 28, rw - 36, rh - 44, 12);
+    ctx.fill();
+
+    ctx.strokeStyle = '#b3e5fc';
+    ctx.lineWidth = 8;
+    ctx.beginPath();
+    const tailBaseX = m.facing === 1 ? rx + 18 : rx + rw - 18;
+    ctx.moveTo(tailBaseX, ry - 42);
+    ctx.lineTo(tailBaseX - m.facing * 45, ry - 56 + Math.sin(Date.now() * 0.012) * 8);
+    ctx.stroke();
+
+    const headX = m.facing === 1 ? rx + rw - 32 : rx + 4;
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#f5f5f5';
+    ctx.fillRect(headX, ry - rh + 12, 28, 24);
+
+    ctx.fillStyle = '#29b6f6';
+    ctx.beginPath();
+    const hornBaseX = m.facing === 1 ? headX + 20 : headX + 8;
+    ctx.moveTo(hornBaseX - 4, ry - rh + 12);
+    ctx.lineTo(hornBaseX + m.facing * 16, ry - rh - 18);
+    ctx.lineTo(hornBaseX + 4, ry - rh + 12);
+    ctx.fill();
+
+    ctx.fillStyle = '#00e5ff';
+    ctx.fillRect(m.facing === 1 ? headX + 18 : headX + 6, ry - rh + 18, 5, 4);
+
+    if (m.state === 'kirinAroundThunder' || m.state === 'kirinTargetThunder' || m.state === 'kirinGrandThunder') {
+      ctx.fillStyle = '#80d8ff';
+      ctx.beginPath();
+      ctx.arc(hornBaseX + m.facing * 12, ry - rh - 14, m.state === 'kirinGrandThunder' ? 14 : 10, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.fillStyle = '#90a4ae';
+    ctx.fillRect(rx + 28, ry - 20, 10, 20);
+    ctx.fillRect(rx + rw - 38, ry - 20, 10, 20);
+
+    ctx.restore();
+    return;
+  }
+
+  if (sp === 'zinogre') {
+    if (m.isCharged) {
+      ctx.shadowColor = '#00e5ff';
+      ctx.shadowBlur = 16;
+    }
+
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#00838f';
+    ctx.beginPath();
+    ctx.roundRect(rx + 12, ry - rh + 25, rw - 24, rh - 38, 12);
+    ctx.fill();
+
+    ctx.fillStyle = m.isCharged ? '#e0f7fa' : '#cfd8dc';
+    ctx.beginPath();
+    ctx.moveTo(rx + 25, ry - rh + 25);
+    ctx.lineTo(rx + 42, ry - rh + 8);
+    ctx.lineTo(rx + 58, ry - rh + 25);
+    ctx.lineTo(rx + 74, ry - rh + 10);
+    ctx.lineTo(rx + 88, ry - rh + 25);
+    ctx.fill();
+
+    ctx.strokeStyle = '#006064';
+    ctx.lineWidth = 14;
+    ctx.beginPath();
+    const tailBaseX = m.facing === 1 ? rx + 14 : rx + rw - 14;
+    ctx.moveTo(tailBaseX, ry - 32);
+    ctx.lineTo(tailBaseX - m.facing * 68, ry - 48 + Math.sin(Date.now() * 0.008) * 8);
+    ctx.stroke();
+
+    const headX = m.facing === 1 ? rx + rw - 28 : rx - 8;
+    ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : '#0097a7';
+    ctx.fillRect(headX, ry - rh + 14, 36, 26);
+
+    ctx.fillStyle = '#ffd54f';
+    ctx.beginPath();
+    ctx.moveTo(headX + (m.facing === 1 ? 8 : 28), ry - rh + 14);
+    ctx.lineTo(headX + (m.facing === 1 ? -6 : 42), ry - rh - 2);
+    ctx.lineTo(headX + (m.facing === 1 ? 18 : 18), ry - rh + 14);
+    ctx.fill();
+
+    ctx.fillStyle = '#ffee58';
+    ctx.fillRect(m.facing === 1 ? headX + 22 : headX + 8, ry - rh + 20, 6, 5);
+
+    if (m.state === 'thunderClaw') {
+      ctx.fillStyle = '#00e5ff';
+      ctx.beginPath();
+      ctx.arc(m.facing === 1 ? rx + rw - 15 : rx + 15, ry - 20, 14, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.fillStyle = '#004d40';
+    ctx.fillRect(rx + 24, ry - 18, 16, 18);
+    ctx.fillRect(rx + rw - 40, ry - 18, 16, 18);
+
+    ctx.restore();
+    return;
+  }
+
+  // リオレウス / リオレイア
+  const isRathian = sp === 'rathian';
+  const wingColor = isRathian ? '#1e4620' : '#6e1414';
+  const bodyColor = isRathian ? '#2e7d32' : '#a81c1c';
+  const tailColor = isRathian ? '#4a148c' : '#801313';
+  const headColor = isRathian ? '#388e3c' : '#c02222';
+
+  const wingFlap = Math.sin(Date.now() * 0.015) * (m.isFlying ? 25 : 8);
+  ctx.fillStyle = wingColor;
+  ctx.beginPath();
+  ctx.moveTo(rx + rw / 2, ry - rh + 25);
+  ctx.lineTo(rx + rw / 2 - m.facing * 75, ry - rh - 30 + wingFlap);
+  ctx.lineTo(rx + rw / 2 - m.facing * 20, ry - rh + 45);
+  ctx.fill();
+
+  ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : bodyColor;
+  ctx.beginPath();
+  ctx.roundRect(rx + 15, ry - rh + 20, rw - 30, rh - 30, 15);
+  ctx.fill();
+
+  ctx.strokeStyle = tailColor;
+  ctx.lineWidth = 10;
+  ctx.beginPath();
+  const tailBaseX = m.facing === 1 ? rx + 15 : rx + rw - 15;
+  ctx.moveTo(tailBaseX, ry - 30);
+  if (m.state === 'poisonTail') {
+    const tailTipX = tailBaseX - m.facing * 75;
+    const tailTipY = ry - 20;
+    ctx.lineTo(tailTipX, tailTipY);
+    ctx.stroke();
+    ctx.fillStyle = '#c94bff';
+    ctx.beginPath();
+    ctx.arc(tailTipX, tailTipY, 10, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.lineTo(tailBaseX - m.facing * 65, ry - 45 + Math.sin(Date.now() * 0.008) * 10);
+    ctx.stroke();
+  }
+
+  const headX = m.facing === 1 ? rx + rw - 25 : rx - 10;
+  ctx.fillStyle = m.flashTimer > 0 ? '#ffffff' : headColor;
+  ctx.fillRect(headX, ry - rh + 10, 35, 28);
+
+  ctx.fillStyle = '#ffcc00';
+  ctx.fillRect(m.facing === 1 ? headX + 20 : headX + 8, ry - rh + 16, 6, 5);
+
+  if (m.state === 'fireball' && m.stateTimer > 25) {
+    ctx.fillStyle = '#ff6600';
+    ctx.beginPath();
+    ctx.arc(m.facing === 1 ? headX + 35 : headX, ry - rh + 26, 10, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (m.state === 'poisonShot' && m.stateTimer > 25) {
+    ctx.fillStyle = '#b829ff';
+    ctx.beginPath();
+    ctx.arc(m.facing === 1 ? headX + 35 : headX, ry - rh + 26, 10, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = '#4a3525';
+  ctx.fillRect(rx + 30, ry - 15, 14, 15);
+  ctx.fillRect(rx + rw - 44, ry - 15, 14, 15);
+
+  ctx.restore();
+}
+
+function drawEquipMenu() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const boxW = 810;
+  const boxH = 435;
+  const boxX = (canvas.width - boxW) / 2;
+  const boxY = (canvas.height - boxH) / 2;
+
+  ctx.fillStyle = '#1d1a16';
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.strokeStyle = '#c89d54';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+  ctx.fillStyle = '#ffd700';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillText('【 装備変更 】', boxX + 24, boxY + 36);
+
+  const totalAtk = getTotalAttack();
+  const totalDef = getTotalDefense();
+  const totalFireRes = getTotalFireRes();
+  const totalWaterRes = getTotalWaterRes();
+  const totalThunderRes = getTotalThunderRes();
+  ctx.font = 'bold 14px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#4fc3f7';
+  ctx.fillText(`雷:+${totalThunderRes}${totalThunderRes >= 20 ? '(無)' : ''}`, boxX + boxW - 18, boxY + 36);
+  ctx.fillStyle = '#81d4fa';
+  ctx.fillText(`水:+${totalWaterRes} ｜`, boxX + boxW - 115, boxY + 36);
+  ctx.fillStyle = '#ff8a65';
+  ctx.fillText(`火:+${totalFireRes}${totalFireRes >= 20 ? '(無)' : ''} ｜`, boxX + boxW - 190, boxY + 36);
+  ctx.fillStyle = '#80e27e';
+  ctx.fillText(`防御:${totalDef} ｜`, boxX + boxW - 290, boxY + 36);
+  ctx.fillStyle = '#ffd54f';
+  ctx.fillText(`攻撃:${totalAtk} ｜`, boxX + boxW - 375, boxY + 36);
+  ctx.textAlign = 'left';
+
+  ctx.strokeStyle = '#554734';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(boxX + 20, boxY + 50);
+  ctx.lineTo(boxX + boxW - 20, boxY + 50);
+  ctx.stroke();
+
+  EQUIP_SLOTS.forEach((slot, i) => {
+    const rowY = boxY + 86 + i * 42;
+    const isSelected = i === equipCursor;
+
+    if (isSelected) {
+      ctx.fillStyle = 'rgba(255, 215, 0, 0.16)';
+      ctx.fillRect(boxX + 20, rowY - 25, boxW - 40, 33);
+      ctx.strokeStyle = '#ffd700';
+      ctx.strokeRect(boxX + 20, rowY - 25, boxW - 40, 33);
+    }
+
+    ctx.fillStyle = isSelected ? '#ffd700' : '#bbb';
+    ctx.font = 'bold 17px sans-serif';
+    ctx.fillText(`${isSelected ? '▶ ' : '  '}${slot.label}：`, boxX + 30, rowY - 3);
+
+    if (slot.key === 'weapon') {
+      const wpn = getCurrentWeapon();
+      const typeLabel = getWeaponTypeLabel();
+      const isThunder = wpn.element === 'thunder';
+      const isFire = wpn.element === 'fire';
+      const isWater = wpn.element === 'water';
+      const isIce = wpn.element === 'ice';
+      const isDragon = wpn.element === 'dragon';
+      const elemBonus = getElementSkillBonus(wpn.element);
+
+      ctx.fillStyle = '#ffb74d';
+      ctx.fillText(`[${typeLabel}]`, boxX + 115, rowY - 3);
+
+      ctx.fillStyle = isDragon ? '#ea80fc'
+        : (isIce ? '#80deea'
+          : (isWater ? '#4fc3f7'
+            : (isThunder ? '#4dd0e1'
+              : (isFire ? '#ff7043' : '#fff'))));
+      ctx.fillText(`◀ ${wpn.name} ▶`, boxX + 185, rowY - 3);
+
+      ctx.font = '14px sans-serif';
+      ctx.fillStyle = isDragon ? '#f3e5f5'
+        : (isIce ? '#b2ebf2'
+          : (isWater ? '#81d4fa'
+            : (isThunder ? '#80ffff'
+              : (isFire ? '#ffab91' : '#aaa'))));
+      ctx.fillText(`属性: ${wpn.elementLabel}${elemBonus > 0 ? `(+${elemBonus})` : ''}`, boxX + 445, rowY - 3);
+
+      ctx.font = 'bold 16px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#ffd54f';
+      ctx.fillText(`攻撃力 ${wpn.attack + elemBonus}`, boxX + boxW - 26, rowY - 3);
+      ctx.textAlign = 'left';
+    } else {
+      const itemIdx = player.equipment[slot.key];
+      const item = ARMOR_DB[slot.key][itemIdx];
+      const skillStr = formatSkillsText(item.skills);
+
+      ctx.fillStyle = item.series === 'mizutsune'
+        ? '#f48fb1'
+        : (item.series === 'kirin'
+          ? '#80d8ff'
+          : (item.series === 'rathalos' ? '#ff8a80' : (item.def > 0 ? '#fff' : '#888')));
+      ctx.fillText(`◀ ${item.name} ▶`, boxX + 125, rowY - 3);
+
+      ctx.font = '13px sans-serif';
+      ctx.fillStyle = skillStr ? '#4fc3f7' : '#666';
+      ctx.fillText(skillStr || '-', boxX + 335, rowY - 3);
+
+      ctx.font = 'bold 14px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillStyle = item.def > 0 ? '#80e27e' : '#777';
+      ctx.fillText(`防+${item.def}`, boxX + boxW - 205, rowY - 3);
+
+      ctx.fillStyle = (item.fireRes || 0) > 0 ? '#ff8a65' : '#666';
+      ctx.fillText(`火+${item.fireRes || 0}`, boxX + boxW - 145, rowY - 3);
+
+      ctx.fillStyle = (item.waterRes || 0) > 0 ? '#81d4fa' : '#666';
+      ctx.fillText(`水+${item.waterRes || 0}`, boxX + boxW - 85, rowY - 3);
+
+      ctx.fillStyle = (item.thunderRes || 0) > 0 ? '#4fc3f7' : '#666';
+      ctx.fillText(`雷+${item.thunderRes || 0}`, boxX + boxW - 25, rowY - 3);
+      ctx.textAlign = 'left';
+    }
+  });
+
+  const activeSkillsStr = formatSkillsText(getActiveSkills());
+  ctx.fillStyle = '#2a241d';
+  ctx.fillRect(boxX + 20, boxY + 340, boxW - 40, 32);
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillStyle = '#ffd54f';
+  ctx.fillText(`発動スキル: ${activeSkillsStr || 'なし'}`, boxX + 32, boxY + 361);
+
+  ctx.fillStyle = '#ccc';
+  ctx.font = '13px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('↑↓: 部位選択 ｜ ←→: 装備切替 ｜ Enter(武器欄): 武器種変更 ｜ Ctrl/Esc: 閉じる', canvas.width / 2, boxY + boxH - 16);
+  ctx.textAlign = 'left';
+
+  ctx.restore();
+}
+
+function getSpeciesDisplayName(m) {
+  const extraQ = (EXTRA.quests || []).find(q => q.key === m.species);
+  if (extraQ && extraQ.displayName) return extraQ.displayName;
+
+  switch (m.species) {
+    case 'rathalos': return '火竜 リオレウス';
+    case 'rathian': return '雌火竜 リオレイア';
+    case 'zinogre': return '雷狼竜 ジンオウガ';
+    case 'tobi': return '飛雷竜 トビカガチ';
+    case 'kirin': return '幻獣 キリン';
+    case 'gore': return `黒蝕竜 ゴア・マガラ${m.isFrenzied ? '【狂竜化】' : ''}`;
+    case 'barioth': return '氷牙竜 ベリオロス';
+    case 'mizutsune': return '泡狐竜 タマミツネ';
+    default: return 'モンスター';
+  }
+}
+
+function getSpeciesBarColor(m) {
+  const extraQ = (EXTRA.quests || []).find(q => q.key === m.species);
+  if (extraQ && extraQ.barColor) return extraQ.barColor;
+
+  switch (m.species) {
+    case 'rathalos': return '#c0392b';
+    case 'rathian': return '#27ae60';
+    case 'zinogre': return '#00acc1';
+    case 'tobi': return '#fbc02d';
+    case 'kirin': return '#4fc3f7';
+    case 'gore': return m.isFrenzied ? '#d500f9' : '#6a1b9a';
+    case 'barioth': return '#4dd0e1';
+    case 'mizutsune': return '#ec407a';
+    default: return '#c0392b';
+  }
+}
+
+function drawUI() {
+  // プレイヤーHPバー
+  ctx.fillStyle = '#222';
+  ctx.fillRect(20, 20, 250, 16);
+  ctx.fillStyle = player.paralysisTimer > 0
+    ? '#f1c40f'
+    : (player.poisonTimer > 0
+      ? '#9b59b6'
+      : (player.burnTimer > 0
+        ? '#ff6600'
+        : (player.thunderBlightTimer > 0
+          ? '#00bcd4'
+          : (player.bubbleTimer > 0 ? '#f48fb1' : '#2ecc71'))));
+  ctx.fillRect(20, 20, 250 * (player.hp / player.maxHp), 16);
+  ctx.strokeStyle = '#fff';
+  ctx.strokeRect(20, 20, 250, 16);
+
+  // スタミナバー
+  ctx.fillStyle = '#222';
+  ctx.fillRect(20, 40, 200, 10);
+  ctx.fillStyle = player.demonMode ? '#ff1744' : '#f1c40f';
+  ctx.fillRect(20, 40, 200 * (player.stamina / player.maxStamina), 10);
+
+  // 武器種別ゲージ
+  const isCustomWeapon = (EXTRA.weaponTypes || []).some(t => t.key === player.weaponType);
+  const isGS = player.weaponType === 'greatsword';
+  const isDB = player.weaponType === 'dualblades';
+  if (isCustomWeapon && typeof EXTRA_HOOKS.onDrawWeaponUI === 'function') {
+    EXTRA_HOOKS.onDrawWeaponUI(getHookContext());
+  } else if (isGS) {
+    const maxChargeF = getMaxChargeFrames();
+    const chargeFill = player.state === 'gsCharge' ? Math.min(1, player.chargeFrames / maxChargeF) : 0;
+    const chargeBarColors = ['#90a4ae', '#ffffff', '#ffd700', '#ff3d00'];
+    ctx.fillStyle = '#222';
+    ctx.fillRect(20, 56, 180, 12);
+    ctx.fillStyle = chargeBarColors[player.chargeLevel];
+    ctx.fillRect(20, 56, 180 * chargeFill, 12);
+    ctx.strokeStyle = player.chargeLevel > 0 ? chargeBarColors[player.chargeLevel] : '#888';
+    ctx.lineWidth = player.chargeLevel > 0 ? 2.5 : 1;
+    ctx.strokeRect(20, 56, 180, 12);
+    ctx.lineWidth = 1;
+  } else if (isDB) {
+    ctx.fillStyle = '#222';
+    ctx.fillRect(20, 56, 180, 12);
+    ctx.fillStyle = player.demonMode ? '#ff1744' : '#546e7a';
+    ctx.fillRect(20, 56, player.demonMode ? 180 : 0, 12);
+    ctx.strokeStyle = player.demonMode ? '#ff5252' : '#888';
+    ctx.lineWidth = player.demonMode ? 2.5 : 1;
+    ctx.strokeRect(20, 56, 180, 12);
+    ctx.lineWidth = 1;
+  } else {
+    const auraGlow = ['transparent', '#ffffff', '#ffd700', '#ff2222'][player.spiritLevel];
+    ctx.fillStyle = '#222';
+    ctx.fillRect(20, 56, 180, 12);
+    ctx.fillStyle = '#e74c3c';
+    ctx.fillRect(20, 56, 180 * (player.spirit / player.maxSpirit), 12);
+    ctx.strokeStyle = player.spiritLevel > 0 ? auraGlow : '#888';
+    ctx.lineWidth = player.spiritLevel > 0 ? 3 : 1;
+    ctx.strokeRect(20, 56, 180, 12);
+    ctx.lineWidth = 1;
+  }
+
+  // ステータス文字（常時2段表示：1段目に装備・武器、2段目に回復薬・回復薬グレート・解毒薬）
+  const wpn = getCurrentWeapon();
+  const typeLabel = getWeaponTypeLabel();
+  const totalAtk = getTotalAttack();
+  const bubblyTag = player.bubblyBuffTimer > 0 ? `【泡沫UP:${Math.ceil(player.bubblyBuffTimer / 60)}秒】` : '';
+  const equipLine = `装備: ${getEquipSummaryText()} ｜ [${typeLabel}]${wpn.name}(攻${totalAtk}/${wpn.elementLabel})${bubblyTag}`;
+  const itemLine = `回復薬(H):${player.potions}  回復薬グレート(B):${player.megaPotions}  解毒薬(G):${player.antidotes}`;
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillText(equipLine, 20, 88);
+  ctx.fillStyle = '#a5d6a7';
+  ctx.fillText(itemLine, 20, 108);
+
+  // モンスターHPバー描画
+  const questInfo = QUEST_LIST.find(q => q.key === targetMonster);
+  const starStr = questInfo ? `[${questInfo.stars}] ` : '';
+
+  activeMonsters.forEach((m, idx) => {
+    const barY = 20 + idx * 44;
+    ctx.fillStyle = '#222';
+    ctx.fillRect(530, barY, 350, 16);
+    ctx.fillStyle = getSpeciesBarColor(m);
+    ctx.fillRect(530, barY, 350 * (Math.max(0, m.hp) / m.maxHp), 16);
+    ctx.strokeStyle = '#ffd700';
+    ctx.strokeRect(530, barY, 350, 16);
+
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 13px sans-serif';
+    const statusSuffix = m.hp <= 0 ? ' 【討伐完了】' : '';
+    ctx.fillText(`${starStr}${getSpeciesDisplayName(m)}  HP: ${Math.max(0, m.hp)} / ${m.maxHp}${statusSuffix}`, 530, barY + 31);
+  });
+
+  // 勝敗判定
+  const allDefeated = activeMonsters.every(m => m.hp <= 0) && (targetMonster !== 'raths_duo' || duoRathalosSpawned);
+  if (allDefeated && gameState === 'playing') {
+    gameState = 'win';
+  } else if (player.hp <= 0 && gameState === 'playing') {
+    gameState = 'lose';
+  }
+
+  if (gameState !== 'playing') {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 48px sans-serif';
+    ctx.fillStyle = gameState === 'win' ? '#ffd700' : '#ff3333';
+    ctx.fillText(gameState === 'win' ? 'QUEST CLEAR!（討伐完了）' : '力尽きました…', canvas.width / 2, canvas.height / 2 - 20);
+
+    ctx.font = '20px sans-serif';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Rキーで再挑戦 ｜ Mキーでクエスト選択画面へ', canvas.width / 2, canvas.height / 2 + 30);
+    ctx.textAlign = 'left';
+  }
+}
+
+function resetGame() {
+  player.x = 180; player.y = GROUND_Y; player.hp = 100; player.stamina = 100;
+  player.spirit = 0; player.spiritLevel = 0; player.chargeFrames = 0; player.chargeLevel = 0;
+  player.demonMode = false; player.bubblyBuffTimer = 0;
+  player.potions = 10; player.megaPotions = 10; player.antidotes = 10;
+  player.burnTimer = 0; player.thunderBlightTimer = 0; player.bubbleTimer = 0; player.poisonTimer = 0; player.paralysisTimer = 0;
+  player.frenzyCloudTick = 0;
+  player.state = 'idle'; player.attackHitbox = null;
+  isEquipMenuOpen = false;
+
+  duoRathalosSpawned = false;
+  if (targetMonster === 'raths_duo') {
+    activeMonsters = [createMonsterEntity('rathian', 680)];
+  } else {
+    activeMonsters = [createMonsterEntity(targetMonster, 680)];
+  }
+
+  fireballs = []; poisonClouds = []; thunderOrbs = []; thunderWaves = [];
+  waterJets = []; bubbleOrbs = [];
+  lightningClouds = []; lightningBolts = [];
+  frenzyOrbs = []; frenzyExplosions = []; frenzySpreadClouds = []; iceBeams = []; iceSpears = [];
+  particles = []; floatingTexts = [];
+  gameState = 'playing';
+
+  if (typeof EXTRA_HOOKS.onResetGame === 'function') {
+    EXTRA_HOOKS.onResetGame(getHookContext());
+  }
+}
+
+function gameLoop() {
+  if (gameState === 'playing' && !isEquipMenuOpen && !isWeaknessGuideOpen) {
+    updatePlayer();
+    activeMonsters.forEach(m => updateSingleMonster(m));
+    updateFireballs();
+    updatePoisonClouds();
+    updateThunderOrbs();
+    updateThunderWaves();
+    updateMizutsuneAttacks();
+    updateLightningClouds();
+    updateFrenzyBombs();
+    updateFrenzySpreadClouds();
+    updateBariothAttacks();
+    if (typeof EXTRA_HOOKS.onUpdateProjectiles === 'function') {
+      EXTRA_HOOKS.onUpdateProjectiles(getHookContext());
+    }
+  }
+  draw();
+  requestAnimationFrame(gameLoop);
+}
+
+gameLoop();
+</script>
+</body>
+</html>
